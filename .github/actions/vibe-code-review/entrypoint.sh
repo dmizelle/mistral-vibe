@@ -1,6 +1,12 @@
 #!/bin/bash
 # Vibe Code Review GitHub Action - Main Entrypoint
-# Implements automated code review with persistent session context via teleport
+# Implements automated code review with Mistral Vibe
+#
+# Architecture:
+# - For automated reviews: Uses programmatic mode to get assistant response,
+#   then parses and posts comments directly via gh CLI
+# - For interactive sessions: Creates teleport session and posts link
+# - Session context stored in hidden PR comments for persistence
 
 set -euo pipefail
 
@@ -11,10 +17,13 @@ set -euo pipefail
 # Export GITHUB_TOKEN for gh CLI
 export GITHUB_TOKEN=${GITHUB_TOKEN:-}
 
+# Set REPO from REPOSITORY or GITHUB_REPOSITORY
+export REPO=${REPOSITORY:-${GITHUB_REPOSITORY:-}}
+
 # Ensure required tools are available
-command -v gh >/dev/null 2>&1 || { echo "[ERROR] gh CLI not found"; exit 1; }
-command -v uv >/dev/null 2>&1 || { echo "[ERROR] uv not found"; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo "[ERROR] jq not found"; exit 1; }
+command -v gh >/dev/null 2>&1 || { echo "[ERROR] gh CLI not found. Ensure actions/github-cli/setup-gh-cli ran successfully."; exit 1; }
+command -v uv >/dev/null 2>&1 || { echo "[ERROR] uv not found. Ensure astral-sh/setup-uv ran successfully."; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "[ERROR] jq not found."; exit 1; }
 
 # =============================================================================
 # Constants
@@ -24,7 +33,9 @@ readonly SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 readonly SESSION_MARKER="<!-- VIBE_SESSION:"
 readonly SESSION_MARKER_END="-->"
 readonly MAX_SESSION_METADATA_SIZE=50000
-readonly MAX_PROMPT_LENGTH=30000
+readonly MAX_PROMPT_LENGTH=28000  # Leave room for system messages
+readonly MAX_DIFF_LENGTH=20000
+readonly GITHUB_MAX_COMMENT_SIZE=65000
 
 # =============================================================================
 # Logging
@@ -49,9 +60,9 @@ log_debug() {
 # =============================================================================
 
 validate_inputs() {
-  # Validate REPOSITORY
+  # Validate REPO (set from REPOSITORY env var)
   if [ -z "${REPO:-}" ]; then
-    log_error "REPOSITORY not set"
+    log_error "REPO not set. Environment variable REPOSITORY or GITHUB_REPOSITORY must be set."
     exit 1
   fi
 
@@ -74,21 +85,12 @@ validate_inputs() {
       ;;
   esac
 
-  # Validate AUTO_APPROVE
-  case "${AUTO_APPROVE:-true}" in
-    true|false|True|False|1|0) ;;
-    *) 
-      log_error "Invalid auto_approve: ${AUTO_APPROVE:-} (must be true or false)"
-      exit 1
-      ;;
-  esac
-
-  # Validate WORKDIR exists
-  REPO_ROOT=${GITHUB_WORKSPACE:-$(pwd)}
+  # Validate and set WORKDIR
+  local repo_root=${GITHUB_WORKSPACE:-$(pwd)}
   if [ "${WORKDIR:-.}" = "." ]; then
-    FULL_WORKDIR="$REPO_ROOT"
+    FULL_WORKDIR="$repo_root"
   else
-    FULL_WORKDIR="$REPO_ROOT/${WORKDIR:-}"
+    FULL_WORKDIR="$repo_root/${WORKDIR:-}"
   fi
   
   if [ ! -d "$FULL_WORKDIR" ]; then
@@ -96,7 +98,16 @@ validate_inputs() {
     exit 1
   fi
 
-  log_debug "Validated inputs: REPO=$REPO, PR_NUMBER=$PR_NUMBER, WORKDIR=$WORKDIR, REVIEW_MODE=$REVIEW_MODE"
+  # Validate MODE
+  case "${MODE:-review}" in
+    review|interactive|fix|test) ;;
+    *) 
+      log_error "Invalid mode: ${MODE:-} (must be review, interactive, fix, or test)"
+      exit 1
+      ;;
+  esac
+
+  log_debug "Validated inputs: REPO=$REPO, PR_NUMBER=$PR_NUMBER, WORKDIR=$WORKDIR, MODE=$MODE, REVIEW_MODE=$REVIEW_MODE"
 }
 
 # =============================================================================
@@ -104,11 +115,12 @@ validate_inputs() {
 # =============================================================================
 
 # Make a GitHub API call with retries
-# Args: method, url, [jq_filter]
+# Args: method, endpoint, [jq_filter], [additional_args...]
 gh_api() {
   local method="${1:-GET}"
-  local url="$2"
+  local endpoint="$2"
   local jq_filter="${3:-}"
+  shift 3
   local retries=${GITHUB_API_RETRIES:-3}
   local delay=2
   local attempt
@@ -116,10 +128,20 @@ gh_api() {
   for attempt in $(seq 1 $retries); do
     if [ -n "$jq_filter" ]; then
       local result
-      result=$(gh api "$url" --jq "$jq_filter" 2>&1) && echo "$result" && return 0
+      if [ $# -gt 0 ]; then
+        result=$(gh api "$endpoint" --jq "$jq_filter" "$@" 2>&1) && echo "$result" && return 0
+      else
+        result=$(gh api "$endpoint" --jq "$jq_filter" 2>&1) && echo "$result" && return 0
+      fi
     else
-      gh api "$url" 2>&1 && return 0
+      if [ $# -gt 0 ]; then
+        gh api "$endpoint" "$@" 2>&1 && return 0
+      else
+        gh api "$endpoint" 2>&1 && return 0
+      fi
     fi
+    
+    log_error "GitHub API attempt $attempt/$retries failed for $endpoint"
     
     if [ $attempt -lt $retries ]; then
       sleep $delay
@@ -127,7 +149,7 @@ gh_api() {
     fi
   done
   
-  log_error "GitHub API failed after $retries attempts: $url"
+  log_error "GitHub API failed after $retries attempts: $endpoint"
   return 1
 }
 
@@ -136,10 +158,15 @@ gh_api() {
 # =============================================================================
 
 # Get session metadata from hidden comment
-# Returns JSON string
+# Returns JSON string (empty if no session exists)
 get_session_metadata() {
   local repo="$1"
   local pr_number="$2"
+  
+  if [ -z "$repo" ] || [ -z "$pr_number" ]; then
+    echo '{"version": "1.0", "pr_number": null, "repository": null, "sessions": [], "review_history": [], "comment_tracking": {"comments": []}}'
+    return
+  fi
   
   local comment
   comment=$(gh_api GET "repos/$repo/issues/$pr_number/comments" \
@@ -150,13 +177,18 @@ get_session_metadata() {
     local encoded
     encoded=$(echo "$comment" | sed "s/.*$SESSION_MARKER //;s/ $SESSION_MARKER_END.*//" || true)
     if [ -n "$encoded" ]; then
-      echo "$encoded" | base64 -d 2>/dev/null || echo '{"version": "1.0", "sessions": []}'
+      # Use base64 -d with proper error handling
+      if echo "$encoded" | base64 -d 2>/dev/null; then
+        echo "$encoded" | base64 -d
+      else
+        echo '{"version": "1.0", "sessions": []}'
+      fi
       return
     fi
   fi
   
   # Return empty metadata
-  echo "{\"version\": \"1.0\", \"pr_number\": $pr_number, \"repository\": \"$repo\", \"sessions\": [], \"comment_tracking\": {\"comments\": []}}"
+  echo "{\"version\": \"1.0\", \"pr_number\": $pr_number, \"repository\": \"$repo\", \"sessions\": [], \"review_history\": [], \"comment_tracking\": {\"comments\": []}}"
 }
 
 # Save session metadata to hidden comment
@@ -166,21 +198,27 @@ save_session_metadata() {
   local pr_number="$2"
   local metadata="$3"
   
-  # Check size
-  local encoded
-  encoded=$(echo "$metadata" | base64 -w 0 2>/dev/null || true)
+  if [ -z "$repo" ] || [ -z "$pr_number" ]; then
+    log_error "Cannot save session metadata: missing repo or PR number"
+    return 1
+  fi
   
-  if [ -z "$encoded" ]; then
+  # Encode metadata
+  local encoded
+  if ! encoded=$(echo "$metadata" | base64 -w 0 2>/dev/null); then
     log_error "Failed to encode metadata"
     return 1
   fi
   
   # Truncate if too large
   if [ ${#encoded} -gt $MAX_SESSION_METADATA_SIZE ]; then
-    log_error "Session metadata too large (${#encoded} chars), trimming history"
+    log_error "Session metadata too large (${#encoded} chars > $MAX_SESSION_METADATA_SIZE), trimming history"
     # Remove old sessions but keep the most recent 5
-    metadata=$(echo "$metadata" | jq '.sessions = (.sessions | if length > 5 then .[length-5:] else . end)' 2>/dev/null || echo "$metadata")
-    encoded=$(echo "$metadata" | base64 -w 0 2>/dev/null || true)
+    metadata=$(echo "$metadata" | jq '.sessions = (.sessions | if length > 5 then .[length-5:] else . end) + .review_history = (.review_history | if length > 10 then .[length-10:] else . end)' 2>/dev/null || echo "$metadata")
+    if ! encoded=$(echo "$metadata" | base64 -w 0 2>/dev/null); then
+      log_error "Failed to re-encode trimmed metadata"
+      return 1
+    fi
   fi
   
   local body="$SESSION_MARKER $encoded $SESSION_MARKER_END"
@@ -193,29 +231,25 @@ save_session_metadata() {
   if [ -n "$existing_id" ]; then
     # Update existing comment
     log_debug "Updating existing session metadata comment $existing_id"
-    gh_api PATCH "repos/$repo/issues/comments/$existing_id" -f body="$body" >/dev/null 2>&1 || {
-      log_error "Failed to update session metadata comment"
+    if ! gh_api PATCH "repos/$repo/issues/comments/$existing_id" -f body="$body" >/dev/null 2>&1; then
+      log_error "Failed to update session metadata comment $existing_id"
       return 1
-    }
+    fi
   else
     # Create new comment
     log_debug "Creating new session metadata comment"
-    gh_api POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null 2>&1 || {
+    if ! gh_api POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null 2>&1; then
       log_error "Failed to create session metadata comment"
       return 1
-    }
+    fi
   fi
   
   return 0
 }
 
-# =============================================================================
-# Conversation History Management
-# =============================================================================
-
-# Get full conversation history from metadata
+# Get full review history from metadata
 # Returns formatted string for inclusion in prompts
-get_conversation_history() {
+get_review_history() {
   local metadata="$1"
   
   if [ -z "$metadata" ]; then
@@ -223,28 +257,91 @@ get_conversation_history() {
     return
   fi
   
-  # Extract messages and format them
+  # Extract review history and format
   local history
   history=$(echo "$metadata" | jq -r '
-    .sessions[] | 
-    .messages[] | 
-    select(.role == "user" or .role == "assistant") |
-    "[" + .role + "] " + (.timestamp | sub("\\."; "") | sub("T"; " ") | sub("Z$"; "")) + ": " + .content
+    .review_history[] | 
+    "["
+    + (.timestamp | sub("\\."; "") | sub("T"; " ") | sub("Z$"; ""))
+    + "] "
+    + .role
+    + ": "
+    + .content
   ' 2>/dev/null || true)
   
   if [ -n "$history" ]; then
-    echo "Previous conversation:"
+    echo "Previous review history:"
     echo "$history"
+    echo ""
   else
     echo ""
   fi
 }
 
 # =============================================================================
-# Teleport Session Management
+# Vibe Programmatic Mode
 # =============================================================================
 
-# Create a new teleport session
+# Run vibe in programmatic mode (no teleport) and return the assistant's response
+# Args: prompt, workdir
+# Returns: assistant response or empty string on failure
+run_vibe_programmatic() {
+  local prompt="$1"
+  local workdir="$2"
+  
+  log_info "Running vibe in programmatic mode..."
+  log_debug "Workdir: $workdir"
+  
+  # Validate prompt length
+  if [ ${#prompt} -gt $MAX_PROMPT_LENGTH ]; then
+    log_error "Prompt too long (${#prompt} chars > $MAX_PROMPT_LENGTH max)"
+    return 1
+  fi
+  
+  # Write prompt to temp file to avoid quoting issues
+  local prompt_file
+  prompt_file=$(mktemp) || { log_error "Failed to create temp file"; return 1; }
+  
+  # Use a subshell to ensure cleanup
+  (
+    printf '%s\n' "$prompt" > "$prompt_file"
+    
+    # Run vibe with code-review agent in programmatic mode
+    local exit_code=0
+    local output
+    output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe \
+      --agent code-reviewer \
+      --no-teleport \
+      < "$prompt_file" 2>&1) || exit_code=$?
+    
+    rm -f "$prompt_file"
+    
+    if [ $exit_code -ne 0 ]; then
+      log_error "Vibe failed with exit code $exit_code"
+      log_debug "Vibe output:\n$output"
+      exit 1
+    fi
+    
+    # Extract assistant response (last non-empty line that isn't a status message)
+    # Vibe outputs: status messages to stderr, response to stdout
+    # In programmatic mode, the response is printed to stdout
+    local response
+    response=$(echo "$output" | grep -vE '^\[|%|Preparing|Pushing|Syncing|Teleporting|Connected|Waiting' | tail -1 || true)
+    
+    if [ -n "$response" ]; then
+      echo "$response"
+      return 0
+    else
+      log_error "No response from vibe"
+      log_debug "Full output:\n$output"
+      return 1
+    fi
+  )
+  
+  return $?
+}
+
+# Run vibe in teleport mode (interactive session)
 # Args: prompt, workdir
 # Returns: session URL or empty string on failure
 create_teleport_session() {
@@ -260,34 +357,31 @@ create_teleport_session() {
     return 1
   fi
   
-  # Write prompt to temp file to avoid quoting issues
+  # Write prompt to temp file
   local prompt_file
   prompt_file=$(mktemp) || { log_error "Failed to create temp file"; return 1; }
-  trap "rm -f '$prompt_file'" EXIT
-  printf '%s\n' "$prompt" > "$prompt_file"
   
-  # Run teleport with auto-approve
-  local teleport_output
-  local exit_code
-  
-  if [ "$AUTO_APPROVE" = "true" ]; then
-    teleport_output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe --teleport --agent auto-approve < "$prompt_file" 2>&1) || exit_code=$?
-  else
-    teleport_output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe --teleport < "$prompt_file" 2>&1) || exit_code=$?
-  fi
+  local exit_code=0
+  local output
+  output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe \
+    --teleport \
+    < "$prompt_file" 2>&1) || exit_code=$?
   
   rm -f "$prompt_file"
   
-  log_debug "Teleport output:\n$teleport_output"
+  if [ $exit_code -ne 0 ]; then
+    log_error "Teleport failed with exit code $exit_code"
+    log_debug "Teleport output:\n$output"
+    return 1
+  fi
   
-  # URL is printed to stdout by vibe when teleport completes
-  # It should be a clean URL on its own line
+  # Extract URL from output - URL is printed on its own line in programmatic mode
   local url
-  url=$(echo "$teleport_output" | grep -E '^https://[^/]+/session/[a-zA-Z0-9_-]+$' | tail -1 || true)
+  url=$(echo "$output" | grep -E '^https://[^/]+/session/[a-zA-Z0-9_-]+$' | tail -1 || true)
   
-  # If not found, try less strict pattern
+  # If not found, try more lenient pattern
   if [ -z "$url" ]; then
-    url=$(echo "$teleport_output" | grep -oE 'https://[^/]+/session/[a-zA-Z0-9_-]+' | tail -1 || true)
+    url=$(echo "$output" | grep -oE 'https://[^/]+/session/[a-zA-Z0-9_-]+' | tail -1 || true)
   fi
   
   if [ -n "$url" ]; then
@@ -296,7 +390,7 @@ create_teleport_session() {
     return 0
   else
     log_error "Failed to extract session URL from teleport output"
-    log_error "Teleport output was:\n$teleport_output"
+    log_debug "Teleport output:\n$output"
     return 1
   fi
 }
@@ -340,6 +434,28 @@ is_vibe_command() {
   parse_command "$body" >/dev/null 2>&1
 }
 
+# Determine the mode from command
+# Args: command string
+# Returns: mode (review, interactive, fix, test)
+determine_mode() {
+  local command="$1"
+  
+  case "$command" in
+    interactive|session|"start session")
+      echo "interactive"
+      ;;
+    fix|fix\ *|"fix the issues"|"suggest fixes")
+      echo "fix"
+      ;;
+    test|tests|"add tests"*|"write tests"*)
+      echo "test"
+      ;;
+    *)
+      echo "review"
+      ;;
+  esac
+}
+
 # =============================================================================
 # Comment Posting
 # =============================================================================
@@ -372,22 +488,22 @@ sanitize_line_number() {
   echo "$line"
 }
 
-# Post a summary comment to the PR
-# Args: repo, pr_number, markdown_content
-post_summary_comment() {
+# Post a comment to the PR issue
+# Args: repo, pr_number, body
+post_issue_comment() {
   local repo="$1"
   local pr_number="$2"
-  local content="$3"
+  local body="$3"
   
-  # Truncate content to GitHub's max comment size (65536)
-  if [ ${#content} -gt 65000 ]; then
-    content="${content:0:65000}... (truncated)"
+  # Truncate content to GitHub's max comment size
+  if [ ${#body} -gt $GITHUB_MAX_COMMENT_SIZE ]; then
+    body="${body:0:$GITHUB_MAX_COMMENT_SIZE}... (truncated)"
   fi
   
-  gh_api POST "repos/$repo/issues/$pr_number/comments" -f body="$content" >/dev/null 2>&1 || {
-    log_error "Failed to post summary comment"
+  if ! gh_api POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null 2>&1; then
+    log_error "Failed to post issue comment"
     return 1
-  }
+  fi
   
   return 0
 }
@@ -406,39 +522,77 @@ post_inline_comment() {
   file=$(sanitize_file_path "$file") || return 1
   line=$(sanitize_line_number "$line") || return 1
   
-  # Truncate body
-  if [ ${#body} -gt 65000 ]; then
-    body="${body:0:65000}... (truncated)"
-  fi
-  
-  gh_api POST "repos/$repo/pulls/$pr_number/comments" \
+  if ! gh_api POST "repos/$repo/pulls/$pr_number/comments" \
     -f path="$file" \
     -f line="$line" \
     -f side="$side" \
-    -f body="$body" >/dev/null 2>&1 || {
+    -f body="$body" >/dev/null 2>&1; then
     log_error "Failed to post inline comment for $file:$line"
     return 1
-  }
+  fi
   
   return 0
+}
+
+# Post a suggestion comment (creates one-click apply button in GitHub)
+# Args: repo, pr_number, file, line, code
+post_suggestion() {
+  local repo="$1"
+  local pr_number="$2"
+  local file="$3"
+  local line="$4"
+  local code="$5"
+  
+  local body
+  body="\`\`\`suggestion\n$code\n\`\`\`"
+  
+  post_inline_comment "$repo" "$pr_number" "$file" "$line" "RIGHT" "$body"
+}
+
+# Post session link comment
+# Args: repo, pr_number, session_url, command
+post_session_link() {
+  local repo="$1"
+  local pr_number="$2"
+  local session_url="$3"
+  local command="${4:-review}"
+  
+  local body
+  body="### 🤖 Mistral Vibe Session
+
+A Vibe Code Web session has been created for this PR.
+
+**Command**: \`/vibe $command\`
+
+[Open Vibe Code Session]($session_url)
+
+You can interact with the assistant in this session. For automated review comments to be posted, use the \`/vibe review\` command."
+  
+  post_issue_comment "$repo" "$pr_number" "$body"
 }
 
 # =============================================================================
 # Review Prompt Generation
 # =============================================================================
 
-# Build the review prompt for automated reviews
-# Args: pr_number, diff, repo
-# Returns: prompt string
+# Build the review prompt for programmatic mode
+# The assistant should return a JSON structure that we can parse
 build_review_prompt() {
   local pr_number="$1"
   local diff="$2"
   local repo="$3"
+  local command="$4"
   
-  # Truncate diff if too long
-  local diff_length=${#diff}
-  if [ $diff_length -gt 20000 ]; then
-    diff="${diff:0:20000}... (diff truncated - full diff available in PR)"
+  # Build context from metadata
+  local metadata="$5"
+  local history=""
+  if [ -n "$metadata" ]; then
+    history=$(get_review_history "$metadata")
+  fi
+  
+  # Truncate diff if too large
+  if [ ${#diff} -gt $MAX_DIFF_LENGTH ]; then
+    diff="${diff:0:$MAX_DIFF_LENGTH}... (diff truncated - full diff available in PR)"
   fi
   
   cat <<EOF
@@ -446,71 +600,43 @@ You are Mistral Vibe performing an AUTOMATED code review on GitHub PR #$pr_numbe
 
 ## Your Tasks
 
-1. Analyze all code changes in this PR
-2. Identify issues and categorize them by priority (high/medium/low)
-3. Provide specific, actionable feedback with file paths and line numbers
-4. Use GitHub suggestion syntax for code fixes
-5. Post comments using the gh CLI commands provided below
-6. Format your summary comment EXACTLY as specified
+You MUST respond with a VALID JSON object ONLY. Do not add any text before or after the JSON.
 
-## Output Requirements
+### Required JSON Schema
 
-### Summary Comment (post to PR issue)
-Respond with ONLY this format for the summary (no other text before or after):
+{
+  "status": "approved" | "request_changes" | "needs_review",
+  "summary": "Brief summary of the PR (1-2 sentences)",
+  "issues": {
+    "high": [
+      {
+        "description": "Brief description",
+        "file": "src/file.py",
+        "line": 42,
+        "details": "Detailed explanation",
+        "suggestion": "optional code suggestion (without backticks)"
+      }
+    ],
+    "medium": [...],
+    "low": [...]
+  },
+  "strengths": ["list", "of", "positive observations"],
+  "suggestions_code": [
+    {
+      "file": "src/file.py",
+      "line": 42,
+      "code": "fixed_code_here"
+    }
+  ]
+}
 
-\`\`\`markdown
-## Mistral Vibe Code Review
+## Review Command
 
-**Status**: [✅ Approved / ⚠️ Request Changes / 🔍 Needs Review]
+Command: $command
 
-**Description**: [1-2 sentence summary]
+## Previous Review History
 
-### Issues Found
-
-#### 🔴 High Priority (Must Fix Before Merge)
-- [ ] [description with file:line] - [details]
-
-#### 🟡 Medium Priority (Should Fix)
-- [ ] [description with file:line] - [details]
-
-#### 🟢 Low Priority (Nice to Have)
-- [ ] [description with file:line] - [details]
-
-### Strengths
-- ✅ [positive observation]
-
-**Session**: [Session URL will be provided separately]
-\`\`\`
-
-### Inline Comments
-For specific code issues, post inline PR review comments using the gh CLI.
-Use suggestion syntax for code fixes:
-\`\`\`suggestion
-fixed code here
-\`\`\`
-
-## GitHub API Commands
-
-Use these exact commands to post comments:
-
-\`\`\`bash
-# For summary comment on PR issue
-gh api repos/$repo/issues/$pr_number/comments -f body="STRUCTURED_MARKDOWN"
-
-# For inline PR review comment
-gh api repos/$repo/pulls/$pr_number/comments \\
-  -f body="COMMENT_TEXT" \\
-  -f path="FILE_PATH" \\
-  -f line=LINE_NUMBER \\
-  -f side="RIGHT"
-
-# For suggestion (creates one-click apply button)
-gh api repos/$repo/pulls/$pr_number/comments \\
-  -f body="\`\`\`suggestion\nNEW_CODE\n\`\`\`" \\
-  -f path="FILE_PATH" \\
-  -f line=LINE_NUMBER \\
-  -f side="RIGHT"
-\`\`\`
+$history
 
 ## Code Changes to Review
 
@@ -518,168 +644,327 @@ $diff
 
 ## Review Guidelines
 
-Focus on:
-- Code quality and style (PEP 8 for Python)
-- Potential bugs and edge cases
-- Performance issues
-- Security vulnerabilities (SQL injection, XSS, etc.)
-- Test coverage and quality
-- Code documentation and comments
-- Type hints and validation
-- Error handling
-- API design and REST conventions
-
-Be specific with file paths and line numbers.
-Use suggestion syntax for all code fixes.
-Categorize issues appropriately (high = must fix before merge).
-Check for common issues: missing error handling, hardcoded values, magic numbers, duplicate code, etc.
+- Focus on code quality, bugs, security, performance, and test coverage
+- Be specific with file paths and line numbers
+- For code fixes, provide the corrected code in the suggestion field
+- Use suggestion_code array for GitHub suggestion comments
+- Categorize issues by severity (high = must fix before merge)
 
 ## Review Mode
-Mode: $REVIEW_MODE
-- quick: Focus on critical issues only
-- normal: Balanced review
-- thorough: Comprehensive analysis with minor suggestions
 
-Begin your review now.
+Mode: ${REVIEW_MODE:-normal}
+- quick: Focus on critical issues only (high priority)
+- normal: Balanced review (high and medium)
+- thorough: Comprehensive review (all priorities)
+
+Respond with JSON ONLY.
 EOF
 }
 
+# Parse the JSON response from vibe and post comments
+# Args: repo, pr_number, json_response, workdir, metadata
+parse_and_post_review() {
+  local repo="$1"
+  local pr_number="$2"
+  local json_response="$3"
+  local workdir="$4"
+  local metadata="$5"
+  
+  log_info "Parsing review response..."
+  log_debug "JSON response:\n$json_response"
+  
+  # Validate JSON
+  if ! echo "$json_response" | jq empty 2>/dev/null; then
+    log_error "Invalid JSON response from vibe"
+    log_error "Response was: $json_response"
+    return 1
+  fi
+  
+  # Extract fields
+  local status
+  status=$(echo "$json_response" | jq -r '.status // "needs_review"' 2>/dev/null || echo "needs_review")
+  
+  local summary
+  summary=$(echo "$json_response" | jq -r '.summary // "No summary provided"' 2>/dev/null || echo "No summary provided")
+  
+  # Post summary comment
+  local summary_comment
+  summary_comment="## Mistral Vibe Code Review
+
+**Status**: "
+  
+  case "$status" in
+    approved) summary_comment+="✅ Approved" ;;
+    request_changes) summary_comment+="⚠️ Request Changes" ;;
+    *) summary_comment+="🔍 Needs Review" ;;
+  esac
+  
+  summary_comment+="\n\n**Description**: $summary\n\n"
+  
+  # Add issues by priority
+  local has_issues=false
+  
+  for priority in high medium low; do
+    local priority_emoji
+    local priority_title
+    case "$priority" in
+      high) priority_emoji="🔴"; priority_title="High Priority (Must Fix Before Merge)" ;;
+      medium) priority_emoji="🟡"; priority_title="Medium Priority (Should Fix)" ;;
+      low) priority_emoji="🟢"; priority_title="Low Priority (Nice to Have)" ;;
+    esac
+    
+    local issues
+    issues=$(echo "$json_response" | jq -r ".issues.$priority // [] | length")
+    
+    if [ "$issues" -gt 0 ]; then
+      has_issues=true
+      summary_comment+="### ${priority_emoji} $priority_title\n\n"
+      
+      local i=0
+      while [ $i -lt $issues ]; do
+        local desc
+        desc=$(echo "$json_response" | jq -r ".issues.$priority[$i].description // \"\"" 2>/dev/null || echo "")
+        local file
+        file=$(echo "$json_response" | jq -r ".issues.$priority[$i].file // \"\"" 2>/dev/null || echo "")
+        local line
+        line=$(echo "$json_response" | jq -r ".issues.$priority[$i].line // 0" 2>/dev/null || echo "0")
+        local details
+        details=$(echo "$json_response" | jq -r ".issues.$priority[$i].details // \"\"" 2>/dev/null || echo "")
+        
+        if [ -n "$desc" ] && [ -n "$file" ] && [ "$line" -gt 0 ] 2>/dev/null; then
+          summary_comment+="- [ ] \`$file:$line\` - $desc"
+          if [ -n "$details" ]; then
+            summary_comment+=" - $details"
+          fi
+          summary_comment+="\n"
+        fi
+        
+        i=$((i + 1))
+      done
+      
+      summary_comment+="\n"
+    fi
+  done
+  
+  # Add strengths
+  local strengths
+  strengths=$(echo "$json_response" | jq -r '.strengths // [] | length')
+  
+  if [ "$strengths" -gt 0 ]; then
+    summary_comment+="### Strengths\n\n"
+    
+    local i=0
+    while [ $i -lt $strengths ]; do
+      local strength
+      strength=$(echo "$json_response" | jq -r ".strengths[$i] // \"\"" 2>/dev/null || echo "")
+      if [ -n "$strength" ]; then
+        summary_comment+="- ✅ $strength\n"
+      fi
+      i=$((i + 1))
+    done
+    
+    summary_comment+="\n"
+  fi
+  
+  # Post inline suggestions
+  local suggestions
+  suggestions=$(echo "$json_response" | jq -r '.suggestions_code // [] | length' 2>/dev/null || echo "0")
+  
+  if [ "$suggestions" -gt 0 ]; then
+    local i=0
+    while [ $i -lt $suggestions ]; do
+      local file
+      file=$(echo "$json_response" | jq -r ".suggestions_code[$i].file // \"\"" 2>/dev/null || echo "")
+      local line
+      line=$(echo "$json_response" | jq -r ".suggestions_code[$i].line // 0" 2>/dev/null || echo "0")
+      local code
+      code=$(echo "$json_response" | jq -r ".suggestions_code[$i].code // \"\"" 2>/dev/null || echo "")
+      
+      if [ -n "$file" ] && [ "$line" -gt 0 ] 2>/dev/null && [ -n "$code" ]; then
+        log_debug "Posting suggestion for $file:$line"
+        post_suggestion "$repo" "$pr_number" "$file" "$line" "$code" || log_error "Failed to post suggestion for $file:$line"
+      fi
+      
+      i=$((i + 1))
+    done
+  fi
+  
+  # Post summary comment
+  if ! post_issue_comment "$repo" "$pr_number" "$summary_comment"; then
+    log_error "Failed to post summary comment"
+    return 1
+  fi
+  
+  # Save review to history
+  local timestamp
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  
+  # Create a compact history entry (truncate if needed)
+  local history_entry
+  history_entry=$(echo "$json_response" | jq \
+    --arg ts "$timestamp" \
+    --arg cmd "$command" \
+    '{role: "assistant", content: (.summary + " | " + .status + " | " + (.issues.high | length | tostring) + " high, " + (.issues.medium | length | tostring) + " medium, " + (.issues.low | length | tostring) + " low issues"), timestamp: $ts, command: $cmd}' 2>/dev/null || echo "")
+  
+  if [ -n "$history_entry" ]; then
+    local new_metadata
+    new_metadata=$(echo "$metadata" | jq \
+      --argjson entry "$history_entry" \
+      '.review_history += [$entry]' 2>/dev/null || echo "$metadata")
+    
+    save_session_metadata "$repo" "$pr_number" "$new_metadata"
+  fi
+  
+  log_info "Review posted successfully"
+  return 0
+}
+
 # =============================================================================
-# Session and Command Execution
+# Diff Fetching
 # =============================================================================
 
-# Create session with context (new or continuation)
-# Args: repo, pr_number, command, workdir
-# Returns: session URL
-create_session_with_context() {
+# Get PR diff
+# Args: repo, pr_number
+# Returns: diff text
+get_pr_diff() {
+  local repo="$1"
+  local pr_number="$2"
+  
+  # Try to get unified diff
+  local diff
+  diff=$(gh_api GET "repos/$repo/pulls/$pr_number" --jq '.diff' 2>/dev/null || true)
+  
+  if [ -z "$diff" ]; then
+    # Try alternative: get patch URL and fetch
+    local patch_url
+    patch_url=$(gh_api GET "repos/$repo/pulls/$pr_number" --jq '.patch_url' 2>/dev/null || true)
+    if [ -n "$patch_url" ]; then
+      diff=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$patch_url" 2>/dev/null || true)
+    fi
+  fi
+  
+  echo "$diff"
+}
+
+# =============================================================================
+# Bot Loop Prevention
+# =============================================================================
+
+# Check if the trigger author is a bot
+is_bot_author() {
+  local user="${COMMENT_USER:-}"
+  
+  if [ -z "$user" ]; then
+    # For PR events, check the PR author
+    local pr_author
+    pr_author=$(gh_api GET "repos/$REPO/pulls/$PR_NUMBER" --jq '.user.login' 2>/dev/null || true)
+    user="$pr_author"
+  fi
+  
+  if [ -z "$user" ]; then
+    return 1
+  fi
+  
+  # Check against known bot patterns
+  case "$user" in
+    github-actions*|mistral-vibe*|vibe*|dependabot*|renovate*|actions-user)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# =============================================================================
+# Main Command Execution
+# =============================================================================
+
+# Execute the main review flow
+# Args: repo, pr_number, command, workdir, is_interactive
+execute_review() {
   local repo="$1"
   local pr_number="$2"
   local command="$3"
   local workdir="$4"
+  local mode="$5"
   
+  log_info "Executing $mode mode for PR #$pr_number, command: $command"
+  
+  # Get current metadata
   local metadata
   metadata=$(get_session_metadata "$repo" "$pr_number")
   
-  local has_session
-  has_session=$(echo "$metadata" | jq '.sessions | length > 0' 2>/dev/null || echo "false")
-  
-  local prompt
-  
-  # Get diff
+  # Get PR diff
   local diff
-  diff=$(gh_api GET "repos/$repo/pulls/$pr_number" --jq '.diff' 2>/dev/null || echo "")
+  diff=$(get_pr_diff "$repo" "$pr_number")
   
-  if [ "$has_session" = "true" ]; then
-    # Continue existing session - include history
-    local history
-    history=$(get_conversation_history "$metadata")
-    
-    prompt="$history
-
-New command: $command
+  if [ "$mode" = "interactive" ]; then
+    # Create teleport session for manual interaction
+    local prompt
+    prompt="Command: $command
 
 Context:
 - Repository: $repo
 - PR Number: #$pr_number
 - Working Directory: $workdir
-- You are Mistral Vibe, an AI coding assistant performing code review."
+
+Code Diff:
+$diff
+
+You are in an interactive session. The user will interact with you directly in the web UI."
+    
+    local session_url
+    if ! session_url=$(create_teleport_session "$prompt" "$workdir"); then
+      log_error "Failed to create teleport session"
+      exit 1
+    fi
+    
+    # Post session link
+    post_session_link "$repo" "$pr_number" "$session_url" "$command"
+    
+    # Save session info
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local session_id
+    session_id=$(basename "$session_url")
+    
+    local new_metadata
+    new_metadata=$(echo "$metadata" | jq \
+      --arg url "$session_url" \
+      --arg sid "$session_id" \
+      --arg ts "$timestamp" \
+      --arg cmd "$command" \
+      '.sessions += [{"session_id": $sid, "session_url": $url, "created_at": $ts, "trigger": "issue_comment", "command": $cmd}] | .current_session_id = $sid' 2>/dev/null || echo "$metadata")
+    
+    save_session_metadata "$repo" "$pr_number" "$new_metadata"
+    
+    # Output session URL
+    echo "session_url=$session_url" >> "$GITHUB_OUTPUT"
+    
   else
-    # New session
-    case "$command" in
-      review|review\ *)
-        prompt=$(build_review_prompt "$pr_number" "$diff" "$repo")
-        ;;
-      fix|fix\ *)
-        prompt="Fix the issues in this PR. Repository: $repo, PR #$pr_number.
-
-Diff:
-$diff
-
-Use the gh CLI to post inline comments with fixes using suggestion syntax."
-        ;;
-      "add tests"*|test|tests)
-        prompt="Add comprehensive tests for the changes in this PR. Repository: $repo, PR #$pr_number.
-
-Diff:
-$diff
-
-Generate test files and post them using the gh CLI."
-        ;;
-      explain|explain\ *)
-        prompt="Explain the code changes in this PR. Repository: $repo, PR #$pr_number.
-
-Diff:
-$diff
-
-Provide clear explanations of what the code does."
-        ;;
-      *)
-        # Generic command - include diff
-        prompt="$command
-
-Context: Repository: $repo, PR #$pr_number
-
-Diff:
-$diff"
-        ;;
-    esac
+    # Programmatic mode: run vibe, get response, post comments
+    local prompt
+    prompt=$(build_review_prompt "$pr_number" "$diff" "$repo" "$command" "$metadata")
+    
+    local response
+    if ! response=$(run_vibe_programmatic "$prompt" "$workdir"); then
+      log_error "Vibe programmatic mode failed"
+      exit 1
+    fi
+    
+    # Parse and post the review
+    if ! parse_and_post_review "$repo" "$pr_number" "$response" "$workdir" "$metadata"; then
+      log_error "Failed to post review comments"
+      exit 1
+    fi
+    
+    # Output that review was posted
+    echo "review_posted=true" >> "$GITHUB_OUTPUT"
+    
   fi
   
-  # Create teleport session
-  local url
-  url=$(create_teleport_session "$prompt" "$workdir") || return 1
-  
-  # Save session metadata
-  local session_id
-  session_id=$(basename "$url")
-  local timestamp
-  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  
-  local new_metadata
-  new_metadata=$(echo "$metadata" | jq \
-    --arg url "$url" \
-    --arg sid "$session_id" \
-    --arg ts "$timestamp" \
-    --arg cmd "$command" \
-    --arg trigger "$EVENT_NAME" \
-    '.sessions += [{"session_id": $sid, "session_url": $url, "created_at": $ts, "trigger": $trigger, "command": $cmd, "messages": []}] | .current_session_id = $sid' 2>/dev/null || echo "$metadata")
-  
-  save_session_metadata "$repo" "$pr_number" "$new_metadata" || {
-    log_error "Failed to save session metadata"
-    # Don't fail the whole operation, but log it
-  }
-  
-  echo "$url"
   return 0
-}
-
-# =============================================================================
-# PR vs Issue Detection
-# =============================================================================
-
-# Check if this is a PR (not an issue)
-is_pull_request() {
-  # For issue_comment events, check if it's a PR comment
-  if [ "$EVENT_NAME" = "issue_comment" ]; then
-    # GitHub provides pull_request object for PR comments
-    if [ -n "${GITHUB_EVENT_PULL_REQUEST_NUMBER:-}" ]; then
-      return 0
-    fi
-    # Check via API
-    local is_pr
-    is_pr=$(gh_api GET "repos/$REPO/issues/$PR_NUMBER" --jq '.pull_request | type == "object"' 2>/dev/null || echo "false")
-    if [ "$is_pr" = "true" ]; then
-      return 0
-    fi
-    return 1
-  fi
-  
-  # pull_request and synchronize events are always PRs
-  if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "synchronize" ]; then
-    return 0
-  fi
-  
-  return 1
 }
 
 # =============================================================================
@@ -688,41 +973,39 @@ is_pull_request() {
 
 main() {
   log_info "Starting Vibe Code Review Action"
-  log_debug "Repository: $REPO, PR: $PR_NUMBER, Event: $EVENT_NAME"
+  log_debug "Repository: $REPO, PR: $PR_NUMBER, Event: $EVENT_NAME, Mode: ${MODE:-review}"
   
-  # Validate all inputs first
+  # Validate inputs
   validate_inputs
   
-  # Check if this is a PR (skip if it's just an issue)
-  if ! is_pull_request; then
-    log_info "Skipping: not a pull request (event: $EVENT_NAME, number: $PR_NUMBER)"
+  # Check for bot author to prevent loops
+  if is_bot_author; then
+    log_info "Skipping: command from bot user"
     exit 0
   fi
   
   # Determine trigger type and command
   local command=""
+  local mode=""
   local is_vibe_cmd=false
   
   case "$EVENT_NAME" in
     pull_request)
-      # PR created, synchronized, or reopened
+      # PR created, synchronized, or reopened - trigger automatic review
       command="review"
+      mode="review"
       ;;
     issue_comment)
-      # Comment on PR
-      if is_vibe_command "${COMMENT_BODY:-}"; then
+      # Comment on PR or issue
+      if is_vibe_command "$COMMENT_BODY"; then
         is_vibe_cmd=true
-        command=$(parse_command "${COMMENT_BODY:-}")
-        
-        # Check author to prevent loops
-        if [[ "${COMMENT_USER:-}" =~ github-actions|mistral-vibe|vibe ]]; then
-          log_info "Skipping: command from bot user: ${COMMENT_USER:-}"
-          exit 0
-        fi
+        command=$(parse_command "$COMMENT_BODY")
+        mode=$(determine_mode "$command")
         
         # If command is empty, default to review
         if [ -z "$command" ]; then
           command="review"
+          mode="review"
         fi
       else
         # Not a vibe command, skip
@@ -736,38 +1019,15 @@ main() {
       ;;
   esac
   
-  log_info "Executing command: $command on PR #$PR_NUMBER"
+  log_info "Executing command: $command, Mode: $mode"
   
-  # Execute the command and get session URL
-  local session_url
-  session_url=$(create_session_with_context "$REPO" "$PR_NUMBER" "$command" "$FULL_WORKDIR") || {
-    log_error "Failed to create session"
+  # Execute the review
+  if ! execute_review "$REPO" "$PR_NUMBER" "$command" "$FULL_WORKDIR" "$mode"; then
+    log_error "Failed to execute review"
     exit 1
-  }
+  fi
   
-  # Export for GitHub Actions output
-  export SESSION_URL="$session_url"
-  echo "session_url=$session_url" >> "$GITHUB_OUTPUT"
-  
-  # Post initial comment to PR with session link
-  local comment_body="🤖 **Vibe Code Review Started**
-
-A Vibe Code session has been created to review this PR.
-
-🔗 [Open Session]($session_url)
-
-The Vibe assistant will review the code and post detailed comments shortly.
-
----
-*Command: \`$command\`* | *Trigger: $EVENT_NAME*"
-  
-  post_summary_comment "$REPO" "$PR_NUMBER" "$comment_body" || {
-    log_error "Failed to post initial comment"
-    # Don't fail the action, just log
-  }
-  
-  log_info "Success! Session URL: $session_url"
-  log_info "Note: Code review will be posted to the PR by the Vibe assistant running in the session"
+  log_info "Vibe Code Review completed successfully"
 }
 
 # Run main

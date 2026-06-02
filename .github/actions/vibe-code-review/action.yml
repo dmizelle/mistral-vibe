@@ -1,6 +1,5 @@
 name: Vibe Code Review
-description: Automated code review using Mistral Vibe with persistent sessions
-
+description: Automated code review using Mistral Vibe with persistent context
 inputs:
   github_token:
     description: GitHub token with pull-requests: write and issues: write permissions
@@ -16,32 +15,51 @@ inputs:
     description: Review intensity (quick, normal, thorough)
     required: false
     default: "normal"
-  auto_approve:
-    description: Enable auto-approve for teleport sessions (required for PR branches)
+  mode:
+    description: Execution mode (review for automated comments, interactive for session link only)
     required: false
-    default: "true"
+    default: "review"
+  debug:
+    description: Enable debug logging
+    required: false
+    default: "false"
 
 outputs:
   session_url:
-    description: URL of the created Vibe Code session
+    description: URL of the created Vibe Code session (interactive mode only)
     value: ${{ steps.vibe-review.outputs.session_url }}
+  review_posted:
+    description: Whether review comments were posted (review mode only)
+    value: ${{ steps.vibe-review.outputs.review_posted }}
 
 runs:
   using: "composite"
   steps:
-    - name: Install jq
-      shell: bash
-      run: sudo apt-get update && sudo apt-get install -y jq
+    - name: Checkout action code
+      uses: actions/checkout@v4
+      with:
+        path: vibe-code-review-action
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v3
       with:
         version: "latest"
 
+    - name: Install jq
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          sudo apt-get update && sudo apt-get install -y jq
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          brew install jq
+        else
+          echo "jq not available for $RUNNER_OS, attempting to continue..."
+        fi
+
     - name: Install mistral-vibe
       shell: bash
       run: |
-        cd "$GITHUB_ACTION_PATH"
+        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
         uv sync --locked --all-extras
 
     - name: Set up GitHub CLI
@@ -50,6 +68,7 @@ runs:
     - name: Run Vibe Code Review
       id: vibe-review
       shell: bash
+      timeout-minutes: 15
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         MISTRAL_API_KEY: ${{ inputs.mistral_api_key }}
@@ -60,17 +79,21 @@ runs:
         COMMENT_BODY: ${{ github.event.comment.body || '' }}
         COMMENT_ID: ${{ github.event.comment.id || '' }}
         COMMENT_USER: ${{ github.event.comment.user.login || '' }}
-        AUTO_APPROVE: ${{ inputs.auto_approve }}
         REVIEW_MODE: ${{ inputs.review_mode }}
+        MODE: ${{ inputs.mode }}
+        DEBUG: ${{ inputs.debug }}
       run: |
-        cd "$GITHUB_ACTION_PATH"
+        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
         chmod +x entrypoint.sh
         ./entrypoint.sh
 
-    - name: Output session URL
-      if: always() && steps.vibe-review.outcome == 'success'
+    - name: Output results
+      if: always()
       shell: bash
       run: |
         if [ -n "${{ steps.vibe-review.outputs.session_url }}" ]; then
           echo "Vibe Code session URL: ${{ steps.vibe-review.outputs.session_url }}"
+        fi
+        if [ "${{ steps.vibe-review.outputs.review_posted }}" = "true" ]; then
+          echo "Review comments posted successfully"
         fi
