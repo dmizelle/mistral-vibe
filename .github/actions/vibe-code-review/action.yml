@@ -2,43 +2,41 @@ name: Vibe Code Review
 description: Automated code review using Mistral Vibe with persistent context
 inputs:
   github_token:
-    description: GitHub token with pull-requests: write and issues: write permissions
+    description: 'GitHub token with pull-requests: write and issues: write permissions'
     required: true
   mistral_api_key:
-    description: Mistral API key for Vibe (from console.mistral.ai)
+    description: 'Mistral API key for Vibe from console.mistral.ai'
     required: true
   workdir:
-    description: Working directory relative to repo root
+    description: 'Working directory relative to repo root'
     required: false
     default: "."
   review_mode:
-    description: Review intensity (quick, normal, thorough)
+    description: 'Review intensity quick, normal, thorough'
     required: false
     default: "normal"
   mode:
-    description: Execution mode (interactive for session link, review for automated comments)
+    description: 'Execution mode interactive for session link, review for automated comments'
     required: false
     default: "interactive"
   debug:
-    description: Enable debug logging
+    description: 'Enable debug logging'
     required: false
     default: "false"
 
 outputs:
   session_url:
-    description: URL of the created Vibe Code session (interactive mode only)
+    description: 'URL of the created Vibe Code session interactive mode only'
     value: ${{ steps.vibe-review.outputs.session_url }}
   review_posted:
-    description: Whether review comments were posted (review mode only)
+    description: 'Whether review comments were posted review mode only'
     value: ${{ steps.vibe-review.outputs.review_posted }}
 
 runs:
   using: "composite"
   steps:
-    - name: Checkout action code
+    - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        path: vibe-code-review-action
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v3
@@ -59,7 +57,7 @@ runs:
     - name: Install mistral-vibe
       shell: bash
       run: |
-        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
+        cd "$GITHUB_ACTION_PATH"
         uv sync --locked --all-extras
 
     - name: Set up GitHub CLI
@@ -83,9 +81,8 @@ runs:
         MODE: ${{ inputs.mode }}
         DEBUG: ${{ inputs.debug }}
       run: |
-        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
-        chmod +x entrypoint.sh
-        ./entrypoint.sh
+        chmod +x "$GITHUB_ACTION_PATH/entrypoint.sh"
+        "$GITHUB_ACTION_PATH/entrypoint.sh"
 
     - name: Output results
       if: always()
