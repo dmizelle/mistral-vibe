@@ -991,9 +991,10 @@ main() {
   
   case "$EVENT_NAME" in
     pull_request)
-      # PR created, synchronized, or reopened - trigger automatic review
+      # PR created, synchronized, or reopened
+      # Use MODE input as default (interactive or review)
       command="review"
-      mode="review"
+      mode="${MODE:-interactive}"
       ;;
     issue_comment)
       # Comment on PR or issue
@@ -1002,10 +1003,10 @@ main() {
         command=$(parse_command "$COMMENT_BODY")
         mode=$(determine_mode "$command")
         
-        # If command is empty, default to review
+        # If command is empty, use MODE input as default
         if [ -z "$command" ]; then
           command="review"
-          mode="review"
+          mode="${MODE:-interactive}"
         fi
       else
         # Not a vibe command, skip
