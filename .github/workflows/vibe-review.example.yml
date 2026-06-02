@@ -68,9 +68,9 @@ jobs:
           review_mode: "normal"
           
           # OPTIONAL: Execution mode
-          # - review: Automatic mode - Vibe reviews and posts comments automatically (default)
-          # - interactive: Creates a session link for manual interaction
-          mode: "review"
+          # - interactive: Creates a session link for manual interaction (default)
+          # - review: Automatic mode - Vibe reviews and posts comments automatically
+          mode: "interactive"
           
           # OPTIONAL: Enable debug logging
           debug: "false"

@@ -16,9 +16,9 @@ inputs:
     required: false
     default: "normal"
   mode:
-    description: Execution mode (review for automated comments, interactive for session link only)
+    description: Execution mode (interactive for session link, review for automated comments)
     required: false
-    default: "review"
+    default: "interactive"
   debug:
     description: Enable debug logging
     required: false

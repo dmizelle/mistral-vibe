@@ -21,23 +21,23 @@ Automated code review using Mistral Vibe with persistent context across triggers
 
 This action uses **two distinct modes** to work around Nuage API limitations:
 
-#### Mode 1: Automatic Review (Default)
+#### Mode 1: Interactive Session (Default)
 ```
-GitHub Action → Vibe (programmatic mode) → Parse JSON response → Post comments via gh CLI
-```
-- Vibe runs in **programmatic mode without teleport**
-- Assistant returns **structured JSON** with review findings
-- Action parses JSON and posts comments automatically
-- Full context maintained via hidden comment history
-
-#### Mode 2: Interactive Session
-```
-GitHub Action → Vibe (teleport mode) → Return session URL → Post link to PR
+GitHub Event → Action → Vibe (teleport mode) → Extract URL → Post Link
 ```
 - Creates a **Vibe Code Web session** with context
 - Posts session link to PR
 - User interacts manually in the web UI
 - Context from previous sessions included in prompt
+
+#### Mode 2: Automatic Review
+```
+GitHub Event → Action → Vibe (programmatic mode) → Parse JSON → Post comments via gh CLI
+```
+- Vibe runs in **programmatic mode without teleport**
+- Assistant returns **structured JSON** with review findings
+- Action parses JSON and posts comments automatically
+- Full context maintained via hidden comment history
 
 ## 🚀 Usage
 
@@ -63,7 +63,7 @@ Create the following repository secret:
     # Optional
     workdir: "./src"           # Working directory
     review_mode: "thorough"    # quick | normal | thorough
-    mode: "review"              # review | interactive
+    mode: "interactive"         # interactive | review
     debug: "false"             # Enable debug logging
 ```
 
@@ -171,9 +171,22 @@ This JSON contains:
 - `review_history`: Array of previous review summaries
 - `comment_tracking`: For future use (tracking posted comments)
 
+### Interactive Session Flow (Default)
+
+1. Trigger detected (PR event, `/vibe` command, or any trigger)
+2. Fetch PR diff from GitHub
+3. Get previous context from hidden comment
+4. Build prompt with diff + history
+5. Run `vibe --teleport` to create web session
+6. Extract session URL from output
+7. Post session link to PR
+8. Save session info to hidden comment
+
+**User interaction**: User manually opens the session link and interacts with the assistant in the browser.
+
 ### Automatic Review Flow
 
-1. Trigger detected (PR event or `/vibe` command)
+1. Trigger detected (with `mode: "review"` or `/vibe review` command)
 2. Fetch PR diff from GitHub
 3. Get previous review history from hidden comment
 4. Build prompt with diff + history
@@ -182,17 +195,6 @@ This JSON contains:
 7. Post summary comment to PR issue
 8. Post inline comments and suggestions to PR review
 9. Save review summary to hidden comment
-
-### Interactive Session Flow
-
-1. Trigger detected (interactive command)
-2. Fetch PR diff from GitHub
-3. Get previous context from hidden comment
-4. Build prompt with diff + history
-5. Run `vibe --teleport` to create web session
-6. Extract session URL from output
-7. Post session link to PR
-8. Save session info to hidden comment
 
 ## 📋 Requirements
 
@@ -223,7 +225,7 @@ The action automatically installs:
 | `MISTRAL_API_KEY` | Mistral API key | Yes | - |
 | `WORKDIR` | Working directory relative to repo root | No | "." |
 | `REVIEW_MODE` | Review intensity (quick/normal/thorough) | No | "normal" |
-| `MODE` | Execution mode (review/interactive) | No | "review" |
+| `MODE` | Execution mode (review/interactive) | No | "interactive" |
 | `DEBUG` | Enable debug logging | No | "false" |
 
 ### Review Modes
@@ -238,8 +240,8 @@ The action automatically installs:
 
 | Mode | Description | Output |
 |------|-------------|--------|
+| `interactive` | Creates web session for manual interaction | Posts session link only (default) |
 | `review` | Automatic review with comment posting | Posts comments to PR |
-| `interactive` | Creates web session for manual interaction | Posts session link only |
 
 ## 📁 Examples
 
