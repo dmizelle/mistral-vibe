@@ -1,0 +1,103 @@
+name: Vibe Code Review
+
+# Example workflow for automated PR code reviews using Mistral Vibe
+# 
+# This workflow demonstrates TWO modes of operation:
+#
+# 1. AUTOMATIC REVIEW MODE (default):
+#    - Vibe runs in programmatic mode
+#    - Comments are automatically parsed and posted to the PR
+#    - Best for: automated CI/CD reviews
+#
+# 2. INTERACTIVE SESSION MODE:
+#    - Creates a Vibe Code Web session link
+#    - Human interacts with the session manually
+#    - Best for: manual review with full context
+#
+# To use interactive mode, use: /vibe interactive or /vibe session
+# For automatic reviews, use: /vibe review (or any other command)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+# Required permissions for posting comments
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+# Only run one review per PR at a time to prevent race conditions
+concurrency:
+  group: vibe-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  vibe-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for accurate diffs
+          fetch-depth: 0
+
+      - name: Run Vibe Code Review
+        uses: ./.github/actions/vibe-code-review
+        id: review
+        with:
+          # REQUIRED: GitHub token with pull-requests: write and issues: write
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # REQUIRED: Mistral API key from https://console.mistral.ai
+          # Create a secret named MISTRAL_API_KEY in your repo settings
+          mistral_api_key: ${{ secrets.MISTRAL_API_KEY }}
+          
+          # OPTIONAL: Working directory relative to repo root
+          # Use "." for repo root, or "./src" for a subdirectory
+          workdir: "."
+          
+          # OPTIONAL: Review intensity mode
+          # - quick: Fast review, only critical/high priority issues
+          # - normal: Balanced review (default)
+          # - thorough: Comprehensive review with all suggestions
+          review_mode: "normal"
+          
+          # OPTIONAL: Execution mode
+          # - interactive: Creates a session link for manual interaction (default)
+          # - review: Automatic mode - Vibe reviews and posts comments automatically
+          mode: "interactive"
+          
+          # OPTIONAL: Enable debug logging
+          debug: "false"
+
+      - name: Display results
+        if: always()
+        run: |
+          if [ -n "${{ steps.review.outputs.session_url }}" ]; then
+            echo "::notice::Vibe Code Interactive Session: ${{ steps.review.outputs.session_url }}"
+          fi
+          if [ "${{ steps.review.outputs.review_posted }}" = "true" ]; then
+            echo "::notice::Review comments posted successfully to PR"
+          fi
+
+# =============================================================================
+# ALTERNATIVE: Interactive-only mode
+# =============================================================================
+#
+# To use interactive mode only (creates session links, no automatic comments):
+#
+# jobs:
+#   vibe-review:
+#     uses: ./.github/actions/vibe-code-review
+#     with:
+#       github_token: ${{ secrets.GITHUB_TOKEN }}
+#       mistral_api_key: ${{ secrets.MISTRAL_API_KEY }}
+#       mode: "interactive"
+#
+# This will create Vibe Code Web sessions that users can interact with manually.
+# The assistant will NOT automatically post comments - users must copy/paste.

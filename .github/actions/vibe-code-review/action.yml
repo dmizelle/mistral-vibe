@@ -1,0 +1,100 @@
+name: Vibe Code Review
+description: Automated code review using Mistral Vibe with persistent context
+inputs:
+  github_token:
+    description: 'GitHub token with pull-requests: write and issues: write permissions'
+    required: true
+  mistral_api_key:
+    description: 'Mistral API key for Vibe from console.mistral.ai'
+    required: true
+  workdir:
+    description: 'Working directory relative to repo root'
+    required: false
+    default: "."
+  review_mode:
+    description: 'Review intensity quick, normal, thorough'
+    required: false
+    default: "normal"
+  mode:
+    description: 'Execution mode interactive for session link, review for automated comments'
+    required: false
+    default: "interactive"
+  debug:
+    description: 'Enable debug logging'
+    required: false
+    default: "false"
+
+outputs:
+  session_url:
+    description: 'URL of the created Vibe Code session interactive mode only'
+    value: ${{ steps.vibe-review.outputs.session_url }}
+  review_posted:
+    description: 'Whether review comments were posted review mode only'
+    value: ${{ steps.vibe-review.outputs.review_posted }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+
+    - name: Install jq
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          sudo apt-get update && sudo apt-get install -y jq
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          brew install jq
+        else
+          echo "jq not available for $RUNNER_OS, attempting to continue..."
+        fi
+
+    - name: Install mistral-vibe
+      shell: bash
+      run: |
+        cd "$GITHUB_ACTION_PATH"
+        uv sync --locked --all-extras
+
+    - name: Set up GitHub CLI
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt-get update && sudo apt-get install -y gh
+
+    - name: Run Vibe Code Review
+      id: vibe-review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        MISTRAL_API_KEY: ${{ inputs.mistral_api_key }}
+        WORKDIR: ${{ inputs.workdir }}
+        PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        REPOSITORY: ${{ github.repository }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_BODY: ${{ github.event.comment.body || '' }}
+        COMMENT_ID: ${{ github.event.comment.id || '' }}
+        COMMENT_USER: ${{ github.event.comment.user.login || '' }}
+        REVIEW_MODE: ${{ inputs.review_mode }}
+        MODE: ${{ inputs.mode }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        chmod +x "$GITHUB_ACTION_PATH/entrypoint.sh"
+        "$GITHUB_ACTION_PATH/entrypoint.sh"
+
+    - name: Output results
+      if: always()
+      shell: bash
+      run: |
+        if [ -n "${{ steps.vibe-review.outputs.session_url }}" ]; then
+          echo "Vibe Code session URL: ${{ steps.vibe-review.outputs.session_url }}"
+        fi
+        if [ "${{ steps.vibe-review.outputs.review_posted }}" = "true" ]; then
+          echo "Review comments posted successfully"
+        fi
