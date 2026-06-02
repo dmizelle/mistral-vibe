@@ -1,0 +1,79 @@
+name: Vibe Code Review
+description: Automated code review using Mistral Vibe with persistent sessions
+inputs:
+  github_token:
+    description: GitHub token with pull-requests: write and issues: write permissions
+    required: true
+  mistral_api_key:
+    description: Mistral API key for Vibe (from console.mistral.ai)
+    required: true
+  workdir:
+    description: Working directory relative to repo root
+    required: false
+    default: "."
+  review_mode:
+    description: Review intensity (quick, normal, thorough)
+    required: false
+    default: "normal"
+  auto_approve:
+    description: Enable auto-approve for teleport sessions (required for PR branches)
+    required: false
+    default: "true"
+
+outputs:
+  session_url:
+    description: URL of the created Vibe Code session
+    value: ${{ steps.vibe-review.outputs.session_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout action code
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository }}
+        path: vibe-code-review-action
+        ref: ${{ github.ref }}
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+
+    - name: Install mistral-vibe
+      shell: bash
+      working-directory: ${{ inputs.workdir }}
+      run: |
+        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
+        uv sync --locked --all-extras
+
+    - name: Set up GitHub CLI
+      uses: actions/github-cli/setup-gh-cli@v3
+
+    - name: Run Vibe Code Review
+      id: vibe-review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        MISTRAL_API_KEY: ${{ inputs.mistral_api_key }}
+        WORKDIR: ${{ inputs.workdir }}
+        PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        REPOSITORY: ${{ github.repository }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_BODY: ${{ github.event.comment.body || '' }}
+        COMMENT_ID: ${{ github.event.comment.id || '' }}
+        COMMENT_USER: ${{ github.event.comment.user.login || '' }}
+        AUTO_APPROVE: ${{ inputs.auto_approve }}
+        REVIEW_MODE: ${{ inputs.review_mode }}
+      run: |
+        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
+        chmod +x entrypoint.sh
+        ./entrypoint.sh
+
+    - name: Output session URL
+      if: always() && steps.vibe-review.outcome == 'success'
+      shell: bash
+      run: |
+        if [ -n "${{ steps.vibe-review.outputs.session_url }}" ]; then
+          echo "Vibe Code session URL: ${{ steps.vibe-review.outputs.session_url }}"
+        fi

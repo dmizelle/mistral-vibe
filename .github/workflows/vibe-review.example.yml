@@ -1,0 +1,63 @@
+name: Vibe Code Review
+
+# Example workflow for automated PR code reviews using Mistral Vibe
+# Copy this file to your repository's .github/workflows/ directory
+# and customize as needed.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+# Required permissions
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+# Only run one review per PR at a time
+concurrency:
+  group: vibe-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  vibe-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for accurate diffs
+          fetch-depth: 0
+
+      - name: Run Vibe Code Review
+        uses: ./.github/actions/vibe-code-review
+        with:
+          # GitHub token with required permissions
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # Mistral API key (get from https://console.mistral.ai)
+          # Create a secret named MISTRAL_API_KEY in your repo settings
+          mistral_api_key: ${{ secrets.MISTRAL_API_KEY }}
+          
+          # Working directory relative to repo root
+          # Defaults to "." (repo root)
+          workdir: "."
+          
+          # Review intensity mode
+          # - quick: Fast review, only critical issues
+          # - normal: Balanced review (default)
+          # - thorough: Comprehensive review with all suggestions
+          review_mode: "normal"
+          
+          # Enable auto-approve for teleport sessions
+          # Required for PR branches where code is already pushed
+          auto_approve: "true"
+
+      - name: Display session URL
+        if: success()
+        run: |
+          echo "Vibe Code Review Session: ${{ steps.vibe-review.outputs.session_url }}"
