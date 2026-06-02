@@ -1,5 +1,28 @@
 #!/bin/bash
-# Vibe Code Review GitHub Action - Main Entrypoint
+# Main Logic
+# =============================================================================
+
+main() {
+  log_info "Starting Vibe Code Review Action"
+  log_debug "Repository: $REPO, PR: $PR_NUMBER, Event: $EVENT_NAME, Mode: ${MODE:-review}"
+  
+  # Validate inputs
+  validate_inputs
+=======
+# =============================================================================
+# Main Logic
+# =============================================================================
+
+main() {
+  log_info "Starting Vibe Code Review Action"
+  log_debug "Repository: $REPO, PR: $PR_NUMBER, Event: $EVENT_NAME, Mode: ${MODE:-review}"
+  log_debug "All environment variables: $(env | sort)"
+  log_debug "GITHUB_ACTION_PATH: $GITHUB_ACTION_PATH"
+  log_debug "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+  log_debug "Current directory: $(pwd)"
+  
+  # Validate inputs
+  validate_inputsVibe Code Review GitHub Action - Main Entrypoint
 # Implements automated code review with Mistral Vibe
 #
 # Architecture:
@@ -350,6 +373,8 @@ create_teleport_session() {
   
   log_info "Creating teleport session..."
   log_debug "Workdir: $workdir"
+  log_debug "SCRIPT_DIR: $SCRIPT_DIR"
+  log_debug "Prompt: $prompt"
   
   # Validate prompt length
   if [ ${#prompt} -gt $MAX_PROMPT_LENGTH ]; then
@@ -361,11 +386,20 @@ create_teleport_session() {
   local prompt_file
   prompt_file=$(mktemp) || { log_error "Failed to create temp file"; return 1; }
   
+  log_debug "Created temp file: $prompt_file"
+  log_debug "Writing prompt to temp file"
+  printf '%s\n' "$prompt" > "$prompt_file"
+  log_debug "Prompt written to temp file, contents: $(head -c 200 "$prompt_file")"
+  
   local exit_code=0
   local output
+  log_debug "Running: cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe --teleport < "$prompt_file" 2>&1"
   output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe \
     --teleport \
     < "$prompt_file" 2>&1) || exit_code=$?
+  
+  log_debug "Vibe teleport output: $output"
+  log_debug "Vibe teleport exit code: $exit_code"
   
   rm -f "$prompt_file"
   
@@ -914,9 +948,14 @@ $diff
 
 You are in an interactive session. The user will interact with you directly in the web UI."
     
+    log_debug "About to create teleport session with prompt length: ${#prompt}"
+    log_debug "Workdir: $workdir"
+    log_debug "Changing to workdir: $workdir"
+    
     local session_url
     if ! session_url=$(create_teleport_session "$prompt" "$workdir"); then
       log_error "Failed to create teleport session"
+      log_debug "create_teleport_session exit code: $?"
       exit 1
     fi
     
