@@ -12,65 +12,24 @@ set -euo pipefail
 export GITHUB_TOKEN=${GITHUB_TOKEN:-}
 
 # Ensure required tools are available
-command -v gh >/dev/null 2>&1 || { echo "gh CLI not found"; exit 1; }
-command -v uv >/dev/null 2>&1 || { echo "uv not found"; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo "jq not found"; exit 1; }
+command -v gh >/dev/null 2>&1 || { echo "[ERROR] gh CLI not found"; exit 1; }
+command -v uv >/dev/null 2>&1 || { echo "[ERROR] uv not found"; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "[ERROR] jq not found"; exit 1; }
 
 # =============================================================================
-# Session Metadata Schema (JSON stored in hidden PR comments)
-# =============================================================================
-# {
-#   "version": "1.0",
-#   "pr_number": 123,
-#   "repository": "owner/repo",
-#   "sessions": [
-#     {
-#       "session_id": "nuage-abc123",
-#       "session_url": "https://chat.mistral.ai/session/abc123",
-#       "created_at": "2024-01-01T00:00:00Z",
-#       "trigger": "pull_request",
-#       "command": "review",
-#       "messages": [
-#         {"role": "user", "content": "Review this PR", "timestamp": "..."},
-#         {"role": "assistant", "content": "Found issues...", "timestamp": "..."}
-#       ]
-#     }
-#   ],
-#   "current_session_id": "nuage-abc123",
-#   "comment_tracking": {
-#     "comments": [
-#       {"id": 123456, "file": "src/api.py", "line": 42, "priority": "high", 
-#        "issue": "Missing error handling", "resolved": false, "type": "inline"}
-#     ]
-#   }
-# }
+# Constants
 # =============================================================================
 
+readonly SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+readonly SESSION_MARKER="<!-- VIBE_SESSION:"
+readonly SESSION_MARKER_END="-->"
+readonly MAX_SESSION_METADATA_SIZE=50000
+readonly MAX_PROMPT_LENGTH=30000
+
 # =============================================================================
-# Utility Functions
+# Logging
 # =============================================================================
 
-# Get the action's own directory
-ACTION_DIR=$(dirname "$(readlink -f "$0")")
-
-# Get the repository root (where the PR code lives)
-REPO_ROOT=$(pwd)
-
-# Get GitHub context variables
-REPO=${REPOSITORY:-${GITHUB_REPOSITORY:-}}
-PR_NUMBER=${PR_NUMBER:-}
-EVENT_NAME=${EVENT_NAME:-${GITHUB_EVENT_NAME:-}}
-COMMENT_BODY=${COMMENT_BODY:-}
-COMMENT_ID=${COMMENT_ID:-}
-COMMENT_USER=${COMMENT_USER:-}
-AUTO_APPROVE=${AUTO_APPROVE:-true}
-REVIEW_MODE=${REVIEW_MODE:-normal}
-WORKDIR=${WORKDIR:-.}
-
-# Full workdir path
-FULL_WORKDIR=$(realpath "$REPO_ROOT/$WORKDIR" 2>/dev/null || echo "$REPO_ROOT/$WORKDIR")
-
-# Log messages
 log_info() {
   echo "[INFO] $*"
 }
@@ -86,28 +45,110 @@ log_debug() {
 }
 
 # =============================================================================
+# Input Validation
+# =============================================================================
+
+validate_inputs() {
+  # Validate REPOSITORY
+  if [ -z "${REPO:-}" ]; then
+    log_error "REPOSITORY not set"
+    exit 1
+  fi
+
+  # Validate PR_NUMBER (must be a number)
+  if [ -z "${PR_NUMBER:-}" ]; then
+    log_info "No PR number found, skipping (event: ${EVENT_NAME:-unknown})"
+    exit 0
+  fi
+  if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    log_error "Invalid PR number: $PR_NUMBER"
+    exit 1
+  fi
+
+  # Validate REVIEW_MODE
+  case "${REVIEW_MODE:-normal}" in
+    quick|normal|thorough) ;;
+    *) 
+      log_error "Invalid review_mode: ${REVIEW_MODE:-} (must be quick, normal, or thorough)"
+      exit 1
+      ;;
+  esac
+
+  # Validate AUTO_APPROVE
+  case "${AUTO_APPROVE:-true}" in
+    true|false|True|False|1|0) ;;
+    *) 
+      log_error "Invalid auto_approve: ${AUTO_APPROVE:-} (must be true or false)"
+      exit 1
+      ;;
+  esac
+
+  # Validate WORKDIR exists
+  REPO_ROOT=${GITHUB_WORKSPACE:-$(pwd)}
+  if [ "${WORKDIR:-.}" = "." ]; then
+    FULL_WORKDIR="$REPO_ROOT"
+  else
+    FULL_WORKDIR="$REPO_ROOT/${WORKDIR:-}"
+  fi
+  
+  if [ ! -d "$FULL_WORKDIR" ]; then
+    log_error "Workdir does not exist: $FULL_WORKDIR"
+    exit 1
+  fi
+
+  log_debug "Validated inputs: REPO=$REPO, PR_NUMBER=$PR_NUMBER, WORKDIR=$WORKDIR, REVIEW_MODE=$REVIEW_MODE"
+}
+
+# =============================================================================
+# GitHub API Helper with Retries
+# =============================================================================
+
+# Make a GitHub API call with retries
+# Args: method, url, [jq_filter]
+gh_api() {
+  local method="${1:-GET}"
+  local url="$2"
+  local jq_filter="${3:-}"
+  local retries=${GITHUB_API_RETRIES:-3}
+  local delay=2
+  local attempt
+
+  for attempt in $(seq 1 $retries); do
+    if [ -n "$jq_filter" ]; then
+      local result
+      result=$(gh api "$url" --jq "$jq_filter" 2>&1) && echo "$result" && return 0
+    else
+      gh api "$url" 2>&1 && return 0
+    fi
+    
+    if [ $attempt -lt $retries ]; then
+      sleep $delay
+      delay=$((delay * 2))
+    fi
+  done
+  
+  log_error "GitHub API failed after $retries attempts: $url"
+  return 1
+}
+
+# =============================================================================
 # Hidden Comment Management
 # =============================================================================
 
 # Get session metadata from hidden comment
-# Returns JSON string (may be empty if no session exists)
+# Returns JSON string
 get_session_metadata() {
   local repo="$1"
   local pr_number="$2"
   
-  if [ -z "$repo" ] || [ -z "$pr_number" ]; then
-    echo '{"version": "1.0", "pr_number": null, "repository": null, "sessions": [], "comment_tracking": {"comments": []}}'
-    return
-  fi
-  
   local comment
-  comment=$(gh api repos/"$repo"/issues/"$pr_number"/comments \
-    --jq '.[] | select(.body | test("<!-- VIBE_SESSION:")) | .body' 2>/dev/null || true)
+  comment=$(gh_api GET "repos/$repo/issues/$pr_number/comments" \
+    '.[] | select(.body | test("<!-- VIBE_SESSION:")) | .body' 2>/dev/null || true)
   
   if [ -n "$comment" ]; then
     # Extract and decode the base64 JSON
     local encoded
-    encoded=$(echo "$comment" | sed 's/.*<!-- VIBE_SESSION: //;s/ -->.*//' || true)
+    encoded=$(echo "$comment" | sed "s/.*$SESSION_MARKER //;s/ $SESSION_MARKER_END.*//" || true)
     if [ -n "$encoded" ]; then
       echo "$encoded" | base64 -d 2>/dev/null || echo '{"version": "1.0", "sessions": []}'
       return
@@ -115,7 +156,7 @@ get_session_metadata() {
   fi
   
   # Return empty metadata
-  echo '{"version": "1.0", "pr_number": '"$pr_number'", "repository": "'"$repo"'", "sessions": [], "comment_tracking": {"comments": []}}'
+  echo "{\"version\": \"1.0\", \"pr_number\": $pr_number, \"repository\": \"$repo\", \"sessions\": [], \"comment_tracking\": {\"comments\": []}}"
 }
 
 # Save session metadata to hidden comment
@@ -125,12 +166,7 @@ save_session_metadata() {
   local pr_number="$2"
   local metadata="$3"
   
-  if [ -z "$repo" ] || [ -z "$pr_number" ]; then
-    log_error "Cannot save session metadata: missing repo or PR number"
-    return 1
-  fi
-  
-  # Encode metadata
+  # Check size
   local encoded
   encoded=$(echo "$metadata" | base64 -w 0 2>/dev/null || true)
   
@@ -139,49 +175,33 @@ save_session_metadata() {
     return 1
   fi
   
+  # Truncate if too large
+  if [ ${#encoded} -gt $MAX_SESSION_METADATA_SIZE ]; then
+    log_error "Session metadata too large (${#encoded} chars), trimming history"
+    # Remove old sessions but keep the most recent 5
+    metadata=$(echo "$metadata" | jq '.sessions = (.sessions | if length > 5 then .[length-5:] else . end)' 2>/dev/null || echo "$metadata")
+    encoded=$(echo "$metadata" | base64 -w 0 2>/dev/null || true)
+  fi
+  
+  local body="$SESSION_MARKER $encoded $SESSION_MARKER_END"
+  
   # Find existing hidden comment
   local existing_id
-  existing_id=$(gh api repos/"$repo"/issues/"$pr_number"/comments \
-    --jq '.[] | select(.body | test("<!-- VIBE_SESSION:")) | .id' 2>/dev/null || true)
-  
-  local body="<!-- VIBE_SESSION: $encoded -->"
+  existing_id=$(gh_api GET "repos/$repo/issues/$pr_number/comments" \
+    '.[] | select(.body | test("<!-- VIBE_SESSION:")) | .id' 2>/dev/null || true)
   
   if [ -n "$existing_id" ]; then
     # Update existing comment
     log_debug "Updating existing session metadata comment $existing_id"
-    gh api repos/"$repo"/issues/comments/"$existing_id" \
-      -X PATCH \
-      -f body="$body" >/dev/null 2>&1 || {
+    gh_api PATCH "repos/$repo/issues/comments/$existing_id" -f body="$body" >/dev/null 2>&1 || {
       log_error "Failed to update session metadata comment"
       return 1
     }
   else
     # Create new comment
     log_debug "Creating new session metadata comment"
-    gh api repos/"$repo"/issues/"$pr_number"/comments \
-      -f body="$body" >/dev/null 2>&1 || {
+    gh_api POST "repos/$repo/issues/$pr_number/comments" -f body="$body" >/dev/null 2>&1 || {
       log_error "Failed to create session metadata comment"
-      return 1
-    }
-  fi
-  
-  return 0
-}
-
-# Delete session metadata comment
-# Args: repo, pr_number
-delete_session_metadata() {
-  local repo="$1"
-  local pr_number="$2"
-  
-  local existing_id
-  existing_id=$(gh api repos/"$repo"/issues/"$pr_number"/comments \
-    --jq '.[] | select(.body | test("<!-- VIBE_SESSION:")) | .id' 2>/dev/null || true)
-  
-  if [ -n "$existing_id" ]; then
-    gh api repos/"$repo"/issues/comments/"$existing_id" \
-      -X DELETE >/dev/null 2>&1 || {
-      log_error "Failed to delete session metadata comment"
       return 1
     }
   fi
@@ -209,12 +229,7 @@ get_conversation_history() {
     .sessions[] | 
     .messages[] | 
     select(.role == "user" or .role == "assistant") |
-    "["
-    + .role
-    + "] "
-    + (.timestamp | sub("\\."; "") | sub("T"; " ") | sub("Z$"; ""))
-    + ": "
-    + .content
+    "[" + .role + "] " + (.timestamp | sub("\\."; "") | sub("T"; " ") | sub("Z$"; "")) + ": " + .content
   ' 2>/dev/null || true)
   
   if [ -n "$history" ]; then
@@ -223,24 +238,6 @@ get_conversation_history() {
   else
     echo ""
   fi
-}
-
-# Update metadata with new message
-# Args: metadata, role, content
-# Returns updated metadata JSON
-update_session_messages() {
-  local metadata="$1"
-  local role="$2"
-  local content="$3"
-  local timestamp
-  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  
-  # Add message to current session
-  echo "$metadata" | jq \
-    --arg role "$role" \
-    --arg content "$content" \
-    --arg ts "$timestamp" \
-    '.sessions |= map(if .session_id == .current_session_id then .messages += [{"role": $role, "content": $content, "timestamp": $ts}] else . end)' 2>/dev/null || echo "$metadata"
 }
 
 # =============================================================================
@@ -257,121 +254,49 @@ create_teleport_session() {
   log_info "Creating teleport session..."
   log_debug "Workdir: $workdir"
   
-  # Build teleport command
-  local teleport_cmd=(
-    uv run --directory "$ACTION_DIR" vibe
-    --teleport
-  )
-  
-  # Add auto-approve if enabled
-  if [ "$AUTO_APPROVE" = "true" ]; then
-    teleport_cmd+=(" --agent auto-approve ")
+  # Validate prompt length
+  if [ ${#prompt} -gt $MAX_PROMPT_LENGTH ]; then
+    log_error "Prompt too long (${#prompt} chars > $MAX_PROMPT_LENGTH max)"
+    return 1
   fi
   
-  # Add workdir if specified
-  if [ -n "$workdir" ] && [ "$workdir" != "." ]; then
-    teleport_cmd+=(" --workdir "$workdir")
-  fi
+  # Write prompt to temp file to avoid quoting issues
+  local prompt_file
+  prompt_file=$(mktemp) || { log_error "Failed to create temp file"; return 1; }
+  trap "rm -f '$prompt_file'" EXIT
+  printf '%s\n' "$prompt" > "$prompt_file"
   
-  # Add prompt
-  teleport_cmd+=(" -p """$prompt"""")
-  
-  log_debug "Running: ${teleport_cmd[*]}"
-  
-  # Execute and capture output
+  # Run teleport with auto-approve
   local teleport_output
-  teleport_output=$(cd "$workdir" && "${teleport_cmd[@]}" 2>&1 || true)
+  local exit_code
+  
+  if [ "$AUTO_APPROVE" = "true" ]; then
+    teleport_output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe --teleport --agent auto-approve < "$prompt_file" 2>&1) || exit_code=$?
+  else
+    teleport_output=$(cd "$workdir" && uv run --directory "$SCRIPT_DIR" vibe --teleport < "$prompt_file" 2>&1) || exit_code=$?
+  fi
+  
+  rm -f "$prompt_file"
   
   log_debug "Teleport output:\n$teleport_output"
   
-  # Extract URL from output
-  # Format: TeleportCompleteEvent(url='https://...')
+  # URL is printed to stdout by vibe when teleport completes
+  # It should be a clean URL on its own line
   local url
-  url=$(echo "$teleport_output" | grep -o "url='[^']*'" | sed "s/url='//;s/'//" | head -1 || true)
+  url=$(echo "$teleport_output" | grep -E '^https://[^/]+/session/[a-zA-Z0-9_-]+$' | tail -1 || true)
+  
+  # If not found, try less strict pattern
+  if [ -z "$url" ]; then
+    url=$(echo "$teleport_output" | grep -oE 'https://[^/]+/session/[a-zA-Z0-9_-]+' | tail -1 || true)
+  fi
   
   if [ -n "$url" ]; then
     log_info "Session created: $url"
     echo "$url"
     return 0
   else
-    # Try alternative patterns
-    url=$(echo "$teleport_output" | grep -oi "https://[^\[\]\s]*/session/[^\[\]\s]*" | head -1 || true)
-    if [ -n "$url" ]; then
-      log_info "Session created (alternative pattern): $url"
-      echo "$url"
-      return 0
-    fi
-    
     log_error "Failed to extract session URL from teleport output"
-    echo ""
-    return 1
-  fi
-}
-
-# =============================================================================
-# Session Continuation
-# =============================================================================
-
-# Continue an existing session with new command
-# Args: pr_number, command, workdir, repo
-# Returns: session URL or empty string on failure
-continue_session() {
-  local pr_number="$1"
-  local command="$2"
-  local workdir="$3"
-  local repo="$4"
-  
-  log_info "Continuing session for PR #$pr_number with command: $command"
-  
-  # Get current metadata
-  local metadata
-  metadata=$(get_session_metadata "$repo" "$pr_number")
-  
-  # Get conversation history
-  local history
-  history=$(get_conversation_history "$metadata")
-  
-  # Build prompt with history
-  local prompt
-  prompt=$(cat <<EOF
-$history
-
-New command: $command
-
-Context:
-- Repository: $repo
-- PR Number: #$pr_number
-- Working Directory: $workdir
-- You are Mistral Vibe, an AI coding assistant.
-- You are performing code review and can use the gh CLI to post comments.
-EOF
-  )
-  
-  # Create new teleport session with history
-  local url
-  url=$(create_teleport_session "$prompt" "$workdir")
-  
-  if [ -n "$url" ]; then
-    # Update metadata
-    local session_id
-    session_id=$(echo "$url" | grep -oE '[^/]+$' || echo "new-session-$(date +%s)")
-    local timestamp
-    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    
-    local new_metadata
-    new_metadata=$(echo "$metadata" | jq \
-      --arg url "$url" \
-      --arg sid "$session_id" \
-      --arg ts "$timestamp" \
-      --arg cmd "$command" \
-      '.sessions += [{"session_id": $sid, "session_url": $url, "created_at": $ts, "trigger": "issue_comment", "command": $cmd, "messages": []}] | .current_session_id = $sid' 2>/dev/null || echo "$metadata")
-    
-    save_session_metadata "$repo" "$pr_number" "$new_metadata"
-    
-    echo "$url"
-    return 0
-  else
-    echo ""
+    log_error "Teleport output was:\n$teleport_output"
     return 1
   fi
 }
@@ -385,19 +310,22 @@ EOF
 parse_command() {
   local body="$1"
   
+  # Remove leading/trailing whitespace
+  body=$(echo "$body" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  
   # Check for /vibe command
-  if [[ "$body" =~ ^/vibe\s+(.*) ]]; then
+  if [[ "$body" =~ ^/vibe[[:space:]]+(.*) ]]; then
     echo "${BASH_REMATCH[1]}"
     return 0
   fi
   
-  # Check for @mention
-  if [[ "$body" =~ @(mistral-vibe|vibe)\[bot\]\s+(.*) ]]; then
+  # Check for @mention with bot
+  if [[ "$body" =~ @(mistral-vibe|vibe)\[bot\][[:space:]]+(.*) ]]; then
     echo "${BASH_REMATCH[1]}"
     return 0
   fi
   
-  if [[ "$body" =~ @(mistral-vibe|vibe)\s+(.*) ]]; then
+  if [[ "$body" =~ @(mistral-vibe|vibe)[[:space:]]+(.*) ]]; then
     echo "${BASH_REMATCH[2]}"
     return 0
   fi
@@ -416,42 +344,50 @@ is_vibe_command() {
 # Comment Posting
 # =============================================================================
 
+# Sanitize file path - must be relative and safe
+sanitize_file_path() {
+  local file="$1"
+  
+  # Remove leading slashes
+  file=${file#/}
+  
+  # Check for path traversal
+  if [[ "$file" =~ \.\. ]]; then
+    log_error "Invalid file path (contains ..): $file"
+    return 1
+  fi
+  
+  echo "$file"
+}
+
+# Sanitize line number
+sanitize_line_number() {
+  local line="$1"
+  
+  if ! [[ "$line" =~ ^[0-9]+$ ]]; then
+    log_error "Invalid line number: $line"
+    return 1
+  fi
+  
+  echo "$line"
+}
+
 # Post a summary comment to the PR
-# Args: repo, pr_number, markdown_content, parent_comment_id (optional)
+# Args: repo, pr_number, markdown_content
 post_summary_comment() {
   local repo="$1"
   local pr_number="$2"
   local content="$3"
-  local parent_id="${4:-}"
   
-  # Add session link if available
-  if [ -n "$SESSION_URL" ]; then
-    content="$content
-
----
-
-### 🤖 Mistral Vibe Session
-A Vibe Code session has been created for this PR. You can interact with it here:
-
-[Open Vibe Code Session]($SESSION_URL)"
+  # Truncate content to GitHub's max comment size (65536)
+  if [ ${#content} -gt 65000 ]; then
+    content="${content:0:65000}... (truncated)"
   fi
   
-  if [ -n "$parent_id" ]; then
-    # Update existing comment
-    gh api repos/"$repo"/issues/comments/"$parent_id" \
-      -X PATCH \
-      -f body="$content" >/dev/null 2>&1 || {
-      log_error "Failed to update comment $parent_id"
-      return 1
-    }
-  else
-    # Create new comment
-    gh api repos/"$repo"/issues/"$pr_number"/comments \
-      -f body="$content" >/dev/null 2>&1 || {
-      log_error "Failed to post comment"
-      return 1
-    }
-  fi
+  gh_api POST "repos/$repo/issues/$pr_number/comments" -f body="$content" >/dev/null 2>&1 || {
+    log_error "Failed to post summary comment"
+    return 1
+  }
   
   return 0
 }
@@ -466,7 +402,16 @@ post_inline_comment() {
   local side="${5:-RIGHT}"
   local body="$6"
   
-  gh api repos/"$repo"/pulls/"$pr_number"/comments \
+  # Sanitize inputs
+  file=$(sanitize_file_path "$file") || return 1
+  line=$(sanitize_line_number "$line") || return 1
+  
+  # Truncate body
+  if [ ${#body} -gt 65000 ]; then
+    body="${body:0:65000}... (truncated)"
+  fi
+  
+  gh_api POST "repos/$repo/pulls/$pr_number/comments" \
     -f path="$file" \
     -f line="$line" \
     -f side="$side" \
@@ -478,30 +423,23 @@ post_inline_comment() {
   return 0
 }
 
-# Post a suggestion comment
-# Args: repo, pr_number, file, line, code
-post_suggestion() {
-  local repo="$1"
-  local pr_number="$2"
-  local file="$3"
-  local line="$4"
-  local code="$5"
-  
-  local body
-  body="\`\`\`suggestion\n$code\n\`\`\`"
-  
-  post_inline_comment "$repo" "$pr_number" "$file" "$line" "RIGHT" "$body"
-}
-
 # =============================================================================
 # Review Prompt Generation
 # =============================================================================
 
 # Build the review prompt for automated reviews
+# Args: pr_number, diff, repo
+# Returns: prompt string
 build_review_prompt() {
   local pr_number="$1"
   local diff="$2"
   local repo="$3"
+  
+  # Truncate diff if too long
+  local diff_length=${#diff}
+  if [ $diff_length -gt 20000 ]; then
+    diff="${diff:0:20000}... (diff truncated - full diff available in PR)"
+  fi
   
   cat <<EOF
 You are Mistral Vibe performing an AUTOMATED code review on GitHub PR #$pr_number in repository $repo.
@@ -557,8 +495,7 @@ Use these exact commands to post comments:
 
 \`\`\`bash
 # For summary comment on PR issue
-gh api repos/$repo/issues/$pr_number/comments \\
-  -f body="STRUCTURED_MARKDOWN"
+gh api repos/$repo/issues/$pr_number/comments -f body="STRUCTURED_MARKDOWN"
 
 # For inline PR review comment
 gh api repos/$repo/pulls/$pr_number/comments \\
@@ -608,12 +545,13 @@ EOF
 }
 
 # =============================================================================
-# Command Execution
+# Session and Command Execution
 # =============================================================================
 
-# Execute a vibe command and return the session URL
+# Create session with context (new or continuation)
 # Args: repo, pr_number, command, workdir
-execute_command() {
+# Returns: session URL
+create_session_with_context() {
   local repo="$1"
   local pr_number="$2"
   local command="$3"
@@ -621,21 +559,32 @@ execute_command() {
   
   local metadata
   metadata=$(get_session_metadata "$repo" "$pr_number")
-  local has_session
-  has_session=$(echo "$metadata" | jq -r '.sessions | length > 0' 2>/dev/null || echo "false")
   
-  local url=""
+  local has_session
+  has_session=$(echo "$metadata" | jq '.sessions | length > 0' 2>/dev/null || echo "false")
+  
+  local prompt
+  
+  # Get diff
+  local diff
+  diff=$(gh_api GET "repos/$repo/pulls/$pr_number" --jq '.diff' 2>/dev/null || echo "")
   
   if [ "$has_session" = "true" ]; then
-    # Continue existing session
-    url=$(continue_session "$pr_number" "$command" "$workdir" "$repo")
-  else
-    # Create new session
-    local diff
-    diff=$(gh api repos/"$repo"/pulls/"$pr_number" --jq '.diff' 2>/dev/null || echo "")
+    # Continue existing session - include history
+    local history
+    history=$(get_conversation_history "$metadata")
     
-    # Build prompt based on command
-    local prompt
+    prompt="$history
+
+New command: $command
+
+Context:
+- Repository: $repo
+- PR Number: #$pr_number
+- Working Directory: $workdir
+- You are Mistral Vibe, an AI coding assistant performing code review."
+  else
+    # New session
     case "$command" in
       review|review\ *)
         prompt=$(build_review_prompt "$pr_number" "$diff" "$repo")
@@ -674,29 +623,63 @@ Diff:
 $diff"
         ;;
     esac
-    
-    url=$(create_teleport_session "$prompt" "$workdir")
-    
-    if [ -n "$url" ]; then
-      # Save initial session metadata
-      local session_id
-      session_id=$(echo "$url" | grep -oE '[^/]+$' || echo "nuage-$(date +%s)")
-      local timestamp
-      timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      
-      local new_metadata
-      new_metadata=$(echo "$metadata" | jq \
-        --arg url "$url" \
-        --arg sid "$session_id" \
-        --arg ts "$timestamp" \
-        --arg cmd "$command" \
-        '.sessions += [{"session_id": $sid, "session_url": $url, "created_at": $ts, "trigger": "pull_request", "command": $cmd, "messages": []}] | .current_session_id = $sid' 2>/dev/null || echo "$metadata")
-      
-      save_session_metadata "$repo" "$pr_number" "$new_metadata"
-    fi
   fi
   
+  # Create teleport session
+  local url
+  url=$(create_teleport_session "$prompt" "$workdir") || return 1
+  
+  # Save session metadata
+  local session_id
+  session_id=$(basename "$url")
+  local timestamp
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  
+  local new_metadata
+  new_metadata=$(echo "$metadata" | jq \
+    --arg url "$url" \
+    --arg sid "$session_id" \
+    --arg ts "$timestamp" \
+    --arg cmd "$command" \
+    --arg trigger "$EVENT_NAME" \
+    '.sessions += [{"session_id": $sid, "session_url": $url, "created_at": $ts, "trigger": $trigger, "command": $cmd, "messages": []}] | .current_session_id = $sid' 2>/dev/null || echo "$metadata")
+  
+  save_session_metadata "$repo" "$pr_number" "$new_metadata" || {
+    log_error "Failed to save session metadata"
+    # Don't fail the whole operation, but log it
+  }
+  
   echo "$url"
+  return 0
+}
+
+# =============================================================================
+# PR vs Issue Detection
+# =============================================================================
+
+# Check if this is a PR (not an issue)
+is_pull_request() {
+  # For issue_comment events, check if it's a PR comment
+  if [ "$EVENT_NAME" = "issue_comment" ]; then
+    # GitHub provides pull_request object for PR comments
+    if [ -n "${GITHUB_EVENT_PULL_REQUEST_NUMBER:-}" ]; then
+      return 0
+    fi
+    # Check via API
+    local is_pr
+    is_pr=$(gh_api GET "repos/$REPO/issues/$PR_NUMBER" --jq '.pull_request | type == "object"' 2>/dev/null || echo "false")
+    if [ "$is_pr" = "true" ]; then
+      return 0
+    fi
+    return 1
+  fi
+  
+  # pull_request and synchronize events are always PRs
+  if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "synchronize" ]; then
+    return 0
+  fi
+  
+  return 1
 }
 
 # =============================================================================
@@ -707,22 +690,18 @@ main() {
   log_info "Starting Vibe Code Review Action"
   log_debug "Repository: $REPO, PR: $PR_NUMBER, Event: $EVENT_NAME"
   
-  # Validate required parameters
-  if [ -z "$REPO" ]; then
-    log_error "REPOSITORY not set"
-    exit 1
-  fi
+  # Validate all inputs first
+  validate_inputs
   
-  if [ -z "$PR_NUMBER" ]; then
-    # Not all events have PR numbers - for now, exit gracefully
-    log_info "No PR number found, skipping (event: $EVENT_NAME)"
+  # Check if this is a PR (skip if it's just an issue)
+  if ! is_pull_request; then
+    log_info "Skipping: not a pull request (event: $EVENT_NAME, number: $PR_NUMBER)"
     exit 0
   fi
   
   # Determine trigger type and command
   local command=""
   local is_vibe_cmd=false
-  local should_skip=false
   
   case "$EVENT_NAME" in
     pull_request)
@@ -730,14 +709,14 @@ main() {
       command="review"
       ;;
     issue_comment)
-      # Comment on PR or issue
-      if is_vibe_command "$COMMENT_BODY"; then
+      # Comment on PR
+      if is_vibe_command "${COMMENT_BODY:-}"; then
         is_vibe_cmd=true
-        command=$(parse_command "$COMMENT_BODY")
+        command=$(parse_command "${COMMENT_BODY:-}")
         
         # Check author to prevent loops
-        if [[ "$COMMENT_USER" =~ github-actions|mistral-vibe|vibe ]]; then
-          log_info "Skipping: command from bot user: $COMMENT_USER"
+        if [[ "${COMMENT_USER:-}" =~ github-actions|mistral-vibe|vibe ]]; then
+          log_info "Skipping: command from bot user: ${COMMENT_USER:-}"
           exit 0
         fi
         
@@ -757,24 +736,38 @@ main() {
       ;;
   esac
   
-  log_info "Executing command: $command"
+  log_info "Executing command: $command on PR #$PR_NUMBER"
   
   # Execute the command and get session URL
   local session_url
-  session_url=$(execute_command "$REPO" "$PR_NUMBER" "$command" "$FULL_WORKDIR")
-  
-  if [ -n "$session_url" ]; then
-    # Export for output
-    export SESSION_URL="$session_url"
-    
-    # Output for GitHub Actions
-    echo "session_url=$session_url" >> $GITHUB_OUTPUT
-    
-    log_info "Success! Session URL: $session_url"
-  else
+  session_url=$(create_session_with_context "$REPO" "$PR_NUMBER" "$command" "$FULL_WORKDIR") || {
     log_error "Failed to create session"
     exit 1
-  fi
+  }
+  
+  # Export for GitHub Actions output
+  export SESSION_URL="$session_url"
+  echo "session_url=$session_url" >> "$GITHUB_OUTPUT"
+  
+  # Post initial comment to PR with session link
+  local comment_body="🤖 **Vibe Code Review Started**
+
+A Vibe Code session has been created to review this PR.
+
+🔗 [Open Session]($session_url)
+
+The Vibe assistant will review the code and post detailed comments shortly.
+
+---
+*Command: \`$command\`* | *Trigger: $EVENT_NAME*"
+  
+  post_summary_comment "$REPO" "$PR_NUMBER" "$comment_body" || {
+    log_error "Failed to post initial comment"
+    # Don't fail the action, just log
+  }
+  
+  log_info "Success! Session URL: $session_url"
+  log_info "Note: Code review will be posted to the PR by the Vibe assistant running in the session"
 }
 
 # Run main

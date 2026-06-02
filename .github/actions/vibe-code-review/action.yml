@@ -1,5 +1,6 @@
 name: Vibe Code Review
 description: Automated code review using Mistral Vibe with persistent sessions
+
 inputs:
   github_token:
     description: GitHub token with pull-requests: write and issues: write permissions
@@ -28,12 +29,9 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Checkout action code
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ github.repository }}
-        path: vibe-code-review-action
-        ref: ${{ github.ref }}
+    - name: Install jq
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y jq
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v3
@@ -42,9 +40,8 @@ runs:
 
     - name: Install mistral-vibe
       shell: bash
-      working-directory: ${{ inputs.workdir }}
       run: |
-        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
+        cd "$GITHUB_ACTION_PATH"
         uv sync --locked --all-extras
 
     - name: Set up GitHub CLI
@@ -66,7 +63,7 @@ runs:
         AUTO_APPROVE: ${{ inputs.auto_approve }}
         REVIEW_MODE: ${{ inputs.review_mode }}
       run: |
-        cd "$GITHUB_ACTION_PATH/vibe-code-review-action"
+        cd "$GITHUB_ACTION_PATH"
         chmod +x entrypoint.sh
         ./entrypoint.sh
 

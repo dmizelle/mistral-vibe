@@ -11,38 +11,49 @@ Automated code review using Mistral Vibe with persistent session context across 
 - **GitHub Suggestions**: Uses GitHub's suggestion syntax for one-click code fixes
 - **Session Links**: Posts Vibe Code session URLs to PR for manual interaction
 
-## How It Works
+## ⚠️ Important: How It Works (Async Nature)
 
-This action creates a **new teleport session with full conversation history** for each trigger, since the Nuage API does not expose an endpoint for sending messages to existing sessions. Session metadata and conversation history are stored in hidden PR comments to maintain context.
+This action **creates a Vibe Code Web session** but **does NOT directly post review comments** to your PR. Here's what happens:
 
-### Session Continuation Pattern
+1. The GitHub Action creates a **teleport session** with your PR context and command
+2. The action posts an **initial comment** to the PR with a link to the session
+3. **The Vibe assistant runs asynchronously** in that session and posts comments using the `gh` CLI
+4. Comments appear on your PR **after the Vibe assistant completes its work**
 
-1. On first trigger (PR opened), a new teleport session is created
-2. Session metadata (URL, history, etc.) is stored in a hidden comment: `<!-- VIBE_SESSION: {base64 JSON} -->`
-3. On subsequent triggers (push, comment, etc.):
-   - Previous conversation history is retrieved from the hidden comment
-   - A **new teleport session** is created with the full history + new command
-   - Session metadata is updated with new session info
-4. This provides the appearance of a continuous session while working around API limitations
+**This means:**
+- ✅ You get a session link immediately
+- ⏳ Review comments appear a short time later (depends on Vibe response time)
+- 🔄 Each trigger creates a **new session with full history** (due to API limitations)
+- 📝 Session context is maintained via hidden PR comments
+
+## Why New Sessions Per Trigger?
+
+The Nuage API does not expose an endpoint for sending messages to existing sessions (`POST https://chat.mistral.ai/api/code-trpc/sessions.sendMessage?batch=1` is web-only). 
+
+**Our workaround:** Store conversation history in a hidden PR comment (`<!-- VIBE_SESSION: {base64 JSON} -->`) and create a new teleport session with the full history + new command for each trigger.
+
+**User experience:** It appears as a continuous conversation even though technically it's new sessions with shared context.
 
 ## Usage
 
 ### 1. Copy the Example Workflow
 
-Copy [`.github/workflows/vibe-review.example.yml`](vibe-review.example.yml) to your repository's `.github/workflows/` directory, e.g., as `vibe-review.yml`.
+Copy [`.github/workflows/vibe-review.example.yml`](vibe-review.example.yml) to your repository's `.github/workflows/` directory.
 
 ### 2. Add Required Secrets
 
 Create the following repository secret:
 - **`MISTRAL_API_KEY`**: Your Mistral API key from [console.mistral.ai](https://console.mistral.ai)
+  - ⚠️ **Cost**: Each teleport session uses Mistral API credits
+  - 💡 Get your API key from the Mistral console
 
 ### 3. Customize (Optional)
 
-You can customize the workflow by modifying these inputs:
-
 ```yaml
 - name: Run Vibe Code Review
-  uses: ./.github/actions/vibe-code-review
+  uses: ./.github/actions/vibe-code-review  # Local action (code in your repo)
+  # OR for remote usage:
+  # uses: mistralai/mistral-vibe/.github/actions/vibe-code-review@v2
   with:
     # Required
     github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -62,23 +73,47 @@ You can customize the workflow by modifying these inputs:
 - **PR reopened**: Re-reviews the PR
 
 #### Manual Triggers (via PR comments)
-- `/vibe review` - Perform a full code review
-- `/vibe review again` - Re-review the PR
-- `/vibe review <file>` - Review a specific file
-- `/vibe fix` - Suggest fixes for issues
-- `/vibe fix <file>` - Fix issues in a specific file
-- `/vibe add tests` - Generate tests for the changes
-- `/vibe add tests for <file>` - Generate tests for a specific file
-- `/vibe explain` - Explain the code changes
-- `/vibe explain <topic>` - Explain a specific topic or change
-- `@mistral-vibe review` - Same as `/vibe review`
-- `@mistral-vibe fix the issues` - Same as `/vibe fix`
+
+Use these commands in a PR comment to trigger actions:
+
+| Command | Description |
+|---------|-------------|
+| `/vibe review` | Perform a full code review |
+| `/vibe review again` | Re-review the PR |
+| `/vibe review <file>` | Review a specific file |
+| `/vibe fix` | Suggest fixes for issues |
+| `/vibe fix <file>` | Fix issues in a specific file |
+| `/vibe add tests` | Generate tests for the changes |
+| `/vibe add tests for <file>` | Generate tests for a specific file |
+| `/vibe explain` | Explain the code changes |
+| `/vibe explain <topic>` | Explain a specific topic or change |
+| `@mistral-vibe review` | Same as `/vibe review` |
+| `@mistral-vibe fix the issues` | Same as `/vibe fix` |
+
+**Note:** Commands from bot users (github-actions, mistral-vibe) are ignored to prevent loops.
 
 ## Output Format
 
-### Summary Comment
+### Initial Comment (Posted Immediately by Action)
 
-The action posts a structured summary comment with:
+```markdown
+🤖 **Vibe Code Review Started**
+
+A Vibe Code session has been created to review this PR.
+
+🔗 [Open Session](https://chat.mistral.ai/session/abc123)
+
+The Vibe assistant will review the code and post detailed comments shortly.
+
+---
+*Command: `review`* | *Trigger: pull_request*
+```
+
+### Review Comments (Posted Later by Vibe Assistant)
+
+The Vibe assistant will post:
+
+#### Summary Comment
 
 ```markdown
 ## Mistral Vibe Code Review
@@ -103,16 +138,21 @@ The action posts a structured summary comment with:
 - ✅ Comprehensive test coverage
 - ✅ Clean code organization
 
-[Open Vibe Code Session](https://chat.mistral.ai/session/abc123)
+[Open Session](https://chat.mistral.ai/session/abc123)
 ```
 
-### Inline Comments
+#### Inline Comments
 
-For specific code issues, inline review comments are posted with:
+For specific code issues, inline review comments with:
 - **Regular comments**: For issues that need explanation
 - **Suggestions**: For code fixes using GitHub's suggestion syntax:
   ```suggestion
-  fixed code here
+  # Fixed code with proper error handling
+  try:
+      result = risky_operation()
+  except SpecificError as e:
+      logger.error(f"Operation failed: {e}")
+      raise
   ```
 
 ## Requirements
@@ -124,27 +164,35 @@ The `GITHUB_TOKEN` must have:
 - `issues: write` - To post and update issue comments
 - `contents: read` - To fetch PR diffs
 
-These permissions are automatically granted when using `secrets.GITHUB_TOKEN` in a workflow with the appropriate `permissions` block.
+These permissions are automatically granted when using `secrets.GITHUB_TOKEN` in a workflow with:
+
+```yaml
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+```
 
 ### Dependencies
 
 The action requires:
 - `gh` CLI (GitHub CLI) - Automatically installed via `actions/github-cli/setup-gh-cli`
 - `uv` - Automatically installed via `astral-sh/setup-uv`
-- `jq` - For JSON processing
+- `jq` - Installed via `sudo apt-get install -y jq`
 - Mistral Vibe - Installed via `uv sync`
 
 ## Configuration
 
 ### Environment Variables
 
-| Variable | Description | Required | Default |
-|----------|-------------|----------|---------|
-| `GITHUB_TOKEN` | GitHub API token | Yes | - |
-| `MISTRAL_API_KEY` | Mistral API key | Yes | - |
-| `WORKDIR` | Working directory | No | `.` |
-| `REVIEW_MODE` | Review intensity | No | `normal` |
-| `AUTO_APPROVE` | Enable auto-approve | No | `true` |
+| Variable | Description | Required | Default | Notes |
+|----------|-------------|----------|---------|-------|
+| `GITHUB_TOKEN` | GitHub API token | Yes | - | Automatically masked in logs |
+| `MISTRAL_API_KEY` | Mistral API key | Yes | - | **⚠️ This costs money to use** |
+| `WORKDIR` | Working directory | No | `.` | Relative to repo root |
+| `REVIEW_MODE` | Review intensity | No | `normal` | quick/normal/thorough |
+| `AUTO_APPROVE` | Enable auto-approve | No | `true` | Required for PR branches |
+| `DEBUG` | Enable debug logging | No | `false` | Set to "true" for verbose output |
 
 ### Review Modes
 
@@ -156,35 +204,63 @@ The action requires:
 
 ## Examples
 
-### Basic Workflow
+### Local Repository (Action Code in Your Repo)
 
 ```yaml
 name: Vibe Review
-on: [pull_request]
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
 jobs:
   review:
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      issues: write
-      contents: read
+    concurrency:
+      group: vibe-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/vibe-code-review
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Vibe Code Review
+        uses: ./.github/actions/vibe-code-review
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           mistral_api_key: ${{ secrets.MISTRAL_API_KEY }}
 ```
 
-### With Custom Working Directory
+### Remote Action (From mistral-vibe Repository)
 
 ```yaml
-- uses: ./.github/actions/vibe-code-review
+- name: Run Vibe Code Review
+  uses: mistralai/mistral-vibe/.github/actions/vibe-code-review@v2
   with:
     github_token: ${{ secrets.GITHUB_TOKEN }}
     mistral_api_key: ${{ secrets.MISTRAL_API_KEY }}
     workdir: "./app"
     review_mode: "thorough"
+```
+
+### With Custom Settings
+
+```yaml
+- name: Run Vibe Code Review
+  uses: ./.github/actions/vibe-code-review
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    mistral_api_key: ${{ secrets.MISTRAL_API_KEY }}
+    workdir: "./src"
+    review_mode: "quick"
+    auto_approve: "true"
 ```
 
 ### Only on Specific Branches
@@ -222,16 +298,47 @@ Each session entry includes:
 - `created_at`: ISO timestamp
 - `trigger`: Event type (pull_request, issue_comment)
 - `command`: Command that was executed
-- `messages`: Array of conversation messages
+- `messages`: Array of conversation messages (stored but not yet fully implemented)
+
+### Session Size Limits
+
+- **Max prompt length**: 30,000 characters (truncated if exceeded)
+- **Max session metadata**: 50,000 characters (old sessions trimmed if exceeded)
+- **GitHub comment max**: 65,536 characters
+
+## Rate Limits & Cost
+
+### Mistral API
+- Each teleport session uses Mistral API credits
+- Cost depends on your Mistral plan
+- Check [console.mistral.ai](https://console.mistral.ai) for pricing
+
+### GitHub API
+- Standard GitHub API rate limits apply
+- The action makes ~5-10 API calls per trigger
+- Most repositories have sufficient limits
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **"gh CLI not found"**: Ensure the GitHub CLI action runs before this action
-2. **"Failed to create teleport session"**: Check your Mistral API key is valid
-3. **No comments posted**: Verify the GITHUB_TOKEN has write permissions
-4. **Session URL not extracted**: The teleport output format may have changed
+#### "gh CLI not found"
+**Solution:** The action installs it automatically via `actions/github-cli/setup-gh-cli`. If this fails, check your runner has network access.
+
+#### "Failed to create teleport session"
+**Solutions:**
+1. Verify `MISTRAL_API_KEY` is correct and has credits
+2. Check `WORKDIR` exists and is a valid directory
+3. Enable `DEBUG=true` to see full error output
+
+#### "No comments posted to PR"
+**Note:** The action posts an **initial comment** with the session link. The actual review comments are posted **asynchronously** by the Vibe assistant running in the session. Check:
+1. The session link in the initial comment
+2. The Vibe Code Web session for errors
+3. GitHub Actions workflow logs
+
+#### "Session URL not extracted"
+**Solution:** The URL extraction looks for patterns like `https://chat.mistral.ai/session/abc123`. If the format changes, the action needs updating.
 
 ### Debug Mode
 
@@ -242,16 +349,42 @@ env:
   DEBUG: "true"
 ```
 
+Or pass it via workflow:
+
+```bash
+act -j vibe-review -e test-event.json -s MISTRAL_API_KEY=your_key -s DEBUG=true
+```
+
 ### Checking Logs
 
-View workflow logs in GitHub Actions to see detailed output from the action.
+View workflow logs in GitHub Actions to see:
+- Input validation results
+- Teleport session creation output
+- Session URL extraction
+- API call errors
 
 ## Limitations
 
-1. **True session resumption not available**: Due to API limitations, each trigger creates a new session with history rather than truly resuming
-2. **Rate limits**: Mistral API and GitHub API both have rate limits
-3. **Session links change**: Each new session has a new URL, but the conversation context is maintained
-4. **Large diffs**: Very large PRs may hit token limits
+1. **Async Review Comments**: Review comments are posted by the Vibe assistant asynchronously, not synchronously by the action
+2. **True session resumption not available**: Each trigger creates a new session with history (API limitation)
+3. **Session URLs change**: Each new session has a different URL, but conversation context is maintained
+4. **Large diffs**: Very large PRs may hit token limits (prompt truncated at 30,000 chars)
+5. **No direct API access**: Cannot send messages to existing sessions via Nuage API
+6. **Cost**: Each teleport session uses Mistral API credits
+
+## Security
+
+### Secret Handling
+- `MISTRAL_API_KEY` is passed via GitHub Actions secrets and is automatically masked in logs
+- The API key is used to create teleport sessions via `vibe --teleport`
+- Prompts are passed via stdin to avoid command-line argument exposure
+- All GitHub API calls use the provided `GITHUB_TOKEN`
+
+### Input Sanitization
+- File paths are validated to prevent path traversal attacks
+- Line numbers are validated to be numeric
+- Comment bodies are truncated to GitHub's maximum size
+- Workdir is validated to exist before use
 
 ## Contributing
 
@@ -263,22 +396,46 @@ This action is part of the Mistral Vibe project. Contributions are welcome!
 2. Make changes to files in `.github/actions/vibe-code-review/`
 3. Test locally using `act`:
    ```bash
-   act -j vibe-review -e test-event.json -s MISTRAL_API_KEY=your_key
+   # Install act: https://github.com/nektos/act
+   act -j vibe-review -e .github/actions/vibe-code-review/test-pr-event.json \
+     -s MISTRAL_API_KEY=your_api_key \
+     -s GITHUB_TOKEN=your_github_token
    ```
 4. Commit and push changes
 
 ### Testing
 
-Create test events for local testing:
+Create test event files for local testing:
 
 ```json
-# .github/actions/vibe-code-review/test-pr.json
+# test-pr-event.json
 {
   "action": "opened",
   "number": 123,
   "pull_request": {
+    "number": 123
+  },
+  "repository": {
+    "full_name": "owner/repo",
+    "owner": {
+      "login": "owner"
+    },
+    "name": "repo"
+  }
+}
+
+# test-comment-event.json
+{
+  "action": "created",
+  "issue": {
     "number": 123,
-    "diff_url": "https://github.com/owner/repo/pull/123.diff"
+    "pull_request": {}
+  },
+  "comment": {
+    "body": "/vibe review",
+    "user": {
+      "login": "human-user"
+    }
   },
   "repository": {
     "full_name": "owner/repo"
@@ -286,13 +443,21 @@ Create test events for local testing:
 }
 ```
 
-## License
+### Test Event Types
 
-This action is licensed under the same terms as the Mistral Vibe project.
+| Event | File | Description |
+|-------|------|-------------|
+| PR opened | `test-pr-event.json` | Tests initial PR review |
+| PR push | `test-pr-sync-event.json` | Tests re-review on push |
+| Comment | `test-comment-event.json` | Tests slash command |
 
 ## Support
 
 For issues or questions:
-- Open an issue in the Mistral Vibe repository
+- Open an issue in the [Mistral Vibe repository](https://github.com/mistralai/mistral-vibe)
 - Check the [Mistral AI Documentation](https://docs.mistral.ai)
 - Join the Mistral AI community
+
+## License
+
+This action is licensed under the same terms as the Mistral Vibe project.
